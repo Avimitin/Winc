@@ -137,18 +137,59 @@ pub(crate) fn resolve_face(family: &str, bold: bool, italic: bool) -> Option<Fac
     if let Some(file) = styled.and_then(|name| resolve_file_name(&name)) {
         return Some(FaceMatch { file, bold, italic });
     }
-    resolve_file_name(family).map(|file| FaceMatch {
-        file,
-        bold: false,
-        italic: false,
-    })
+    if let Some(file) = resolve_file_name(family) {
+        return Some(FaceMatch {
+            file,
+            bold: false,
+            italic: false,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut pattern = family.to_owned();
+        if bold {
+            pattern.push_str(":weight=bold");
+        }
+        if italic {
+            pattern.push_str(":slant=italic");
+        }
+        return fontconfig(&pattern).map(|file| FaceMatch { file, bold, italic });
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
 }
 
 /// 返回字体名 `name` 对应的字体文件：先按文件名查找，再按字族名查找（文件名与字族名无关的
-/// 字体，例如 `msyh.ttc`），找不到时返回 `None`。
+/// 字体，例如 `msyh.ttc`），最后交给 fontconfig。Linux 上 fontconfig 是已安装字体的权威
+/// 登记处，还会应用用户的别名和替换设置；只扫描固定目录会漏掉装在别处的字体。
 #[cfg(not(target_os = "macos"))]
 fn resolve_name(name: &str) -> Option<FontFile> {
-    resolve_file_name(name).or_else(|| find_family(name).map(|family| family.file.clone()))
+    let found = resolve_file_name(name)
+        .or_else(|| find_family(name).map(|family| family.file.clone()));
+    #[cfg(target_os = "linux")]
+    let found = found.or_else(|| fontconfig(name));
+    found
+}
+
+/// 通过 `fc-match` 向 fontconfig 查询字体文件；没有 `fc-match`、查询失败或给出的文件不存在
+/// 时返回 `None`。
+#[cfg(target_os = "linux")]
+fn fontconfig(pattern: &str) -> Option<FontFile> {
+    let output = std::process::Command::new("fc-match")
+        .args(["--format", "%{file}\n%{postscriptname}", pattern])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let (file, postscript) = text.split_once('\n').unwrap_or((&text, ""));
+    let path = PathBuf::from(file);
+    path.is_file().then(|| FontFile {
+        path,
+        postscript: (!postscript.is_empty()).then(|| postscript.to_owned()),
+    })
 }
 
 /// 返回字体目录下的全部文件，每项是（规范化文件名，路径）。
