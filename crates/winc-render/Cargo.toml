@@ -25,6 +25,14 @@ softbuffer = "0.4"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Graphics_Gdi"] }
 
+# Linux：运行时加载 libfontconfig，用它的配置、模式匹配和字体列表（不运行 `fc-*` 命令）。
+# `dlopen` 让缺少 libfontconfig 的系统仍能启动，退回扫描常见字体目录；构建时不需要开发文件。
+# `fontconfig` 是 YesLogic 的安全封装；`yeslogic-fontconfig-sys` 只用于安全接口没有覆盖的只读
+# 查询（模式解析、字体路径的原始字节、完整字族列表）。
+[target.'cfg(target_os = "linux")'.dependencies]
+fontconfig = { version = "0.11", features = ["dlopen"] }
+yeslogic-fontconfig-sys = { version = "6.0", features = ["dlopen"] }
+
 # macOS：自己往 IOSurface 里画，再用 CALayer 显示。比 GPU 路径省 100–200 MB 常驻内存。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

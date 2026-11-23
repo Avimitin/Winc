@@ -16,6 +16,8 @@ use swash::{CacheKey, FontRef, StringId};
 use crate::FontSpec;
 use crate::cache::FastMap;
 use crate::text::font_path::FontFile;
+#[cfg(target_os = "linux")]
+use crate::text::fontconfig;
 use crate::text::system_outline::SystemOutlines;
 
 /// 字体种类：编辑区、界面、注释斜体、数学字体，以及终端的正体和斜体。
@@ -51,11 +53,6 @@ impl FontKind {
         matches!(self, FontKind::MonoItalic | FontKind::TerminalItalic)
     }
 }
-
-/// 选后备字体时最多尝试的 fontconfig 结果数（个）。
-///
-/// 取自调参：系统里没有合适的字体时不逐个打开全部字体。
-const SORTED_FONTS: usize = 64;
 
 /// 一个已经打开的字体文件。
 pub(crate) struct Face {
@@ -113,7 +110,7 @@ impl Face {
     /// 打开字体；`shift` 为 `None` 时不固定字重，否则是字重的偏移。
     fn open_as(file: &FontFile, shift: Option<i16>) -> Option<Face> {
         let data = load(&file.path)?;
-        let selected = select(&data, file.postscript.as_deref())?;
+        let selected = select(&data, file.postscript.as_deref(), file.index)?;
         let font = selected.font;
         let (offset, key) = (font.offset, font.key);
         let wanted = f32::from(shift.unwrap_or(0));
@@ -207,7 +204,9 @@ fn sibling(file: &FontFile, font: &FontRef, shift: f32) -> Option<(FontFile, f32
             continue;
         };
         let count = swash::FontDataRef::new(&data).map_or(1, |d| d.len());
-        for other in (0..count).filter_map(|i| FontRef::from_index(&data, i)) {
+        for (index, other) in
+            (0..count).filter_map(|i| FontRef::from_index(&data, i).map(|font| (i, font)))
+        {
             let (other_stretch, weight, other_style) = other.attributes().parts();
             let weight = f32::from(weight.0);
             let between = weight != own && weight >= own.min(wanted) && weight <= own.max(wanted);
@@ -223,6 +222,7 @@ fn sibling(file: &FontFile, font: &FontRef, shift: f32) -> Option<(FontFile, f32
                 let found = FontFile {
                     path: path.clone(),
                     postscript: postscript_name(&other),
+                    index: (count > 1).then_some(index as u32),
                 };
                 best = Some((found, weight - own));
             }
@@ -255,6 +255,14 @@ fn weight_family(font: &FontRef) -> Option<String> {
 
 /// `wght` 轴的标签。
 const WGHT: swash::Tag = swash::tag_from_bytes(b"wght");
+
+/// `ital` 轴的标签。
+#[cfg(target_os = "linux")]
+const ITAL: swash::Tag = swash::tag_from_bytes(b"ital");
+
+/// `slnt` 轴的标签。
+#[cfg(target_os = "linux")]
+const SLNT: swash::Tag = swash::tag_from_bytes(b"slnt");
 
 /// 常规体的字重。
 const REGULAR: f32 = 400.0;
@@ -311,15 +319,26 @@ pub(crate) struct Selected<'a> {
     pub system: bool,
 }
 
-/// 返回字体文件数据 `data` 中 PostScript 名为 `postscript` 的字体。
+/// 返回字体文件数据 `data` 中 PostScript 名为 `postscript` 的字体，或集合文件中下标为
+/// `index` 的字体。
 ///
 /// 名字先与各字体自身的 PostScript 名比对，再与可变字体的命名实例比对（例如苹方的
-/// `PingFangSC-Regular` 是 `PingFangSC-Medium` 字体中的一个实例）。`postscript` 为 `None` 或
-/// 文件中没有该名字时取第一个字体；数据无法解析或选中的字体没有可绘制的字形时返回 `None`。
-pub(crate) fn select<'a>(data: &'a [u8], postscript: Option<&str>) -> Option<Selected<'a>> {
+/// `PingFangSC-Regular` 是 `PingFangSC-Medium` 字体中的一个实例）。名字找不到时看 `index`，
+/// 两者都没有或都找不到时取第一个字体；数据无法解析或选中的字体没有可绘制的字形时返回
+/// `None`。
+pub(crate) fn select<'a>(
+    data: &'a [u8],
+    postscript: Option<&str>,
+    index: Option<u32>,
+) -> Option<Selected<'a>> {
     let first = FontRef::from_index(data, 0)?;
     let (font, instance) = postscript
         .and_then(|postscript| find(data, postscript))
+        .or_else(|| {
+            index.and_then(|index| {
+                FontRef::from_index(data, index as usize).map(|font| (font, None))
+            })
+        })
         .unwrap_or((first, None));
     let has = |tag: &[u8; 4]| font.table(swash::tag_from_bytes(tag)).is_some();
     let system = if GLYPH_TABLES.iter().any(|tag| has(tag)) {
@@ -396,6 +415,30 @@ pub(crate) fn postscript_name(font: &FontRef) -> Option<String> {
         .localized_strings()
         .find_by_id(StringId::PostScript, None)?;
     Some(name.chars().collect())
+}
+
+/// 返回字体文件 `file` 中字体的实际样式（粗体、斜体），与请求的样式无关。
+///
+/// 默认按字体的 OS/2 属性判断；选中的是可变字体的命名实例时，以实例在 `wght`、`ital`、
+/// `slnt` 轴上的取值为准（字重不小于 600 算粗体，斜体轴不为零算斜体）。文件打不开或选不出
+/// 字体时返回 `None`。
+#[cfg(target_os = "linux")]
+pub(crate) fn actual_style(file: &FontFile) -> Option<(bool, bool)> {
+    let data = load(&file.path)?;
+    let selected = select(&data, file.postscript.as_deref(), file.index)?;
+    let (_, weight, style) = selected.font.attributes().parts();
+    let mut bold = weight.0 >= 600;
+    let mut italic = style != swash::Style::Normal;
+    if let Some(instance) = &selected.instance {
+        for (axis, &value) in selected.font.variations().zip(&instance.values) {
+            match axis.tag() {
+                WGHT => bold = value >= 600.0,
+                ITAL | SLNT => italic = value != 0.0,
+                _ => {}
+            }
+        }
+    }
+    Some((bold, italic))
 }
 
 /// 字体文件的内容：当前用户无法修改的文件映射进内存，其余的读进内存，见 [`load`]。
@@ -1031,6 +1074,7 @@ fn italic_candidates(file: &FontFile, face: &Face) -> Vec<FontFile> {
             out.push(FontFile {
                 path: path.clone(),
                 postscript: Some(format!("{base}-Italic")),
+                index: None,
             });
         }
     } else {
@@ -1069,94 +1113,6 @@ fn family_name(font: &FontRef) -> Option<String> {
         .localized_strings()
         .find_by_id(StringId::Family, None)?;
     Some(name.to_string())
-}
-
-/// 返回 fontconfig 中与 `pattern`（如 `monospace`、`sans-serif:lang=zh-cn`）最匹配的字体。
-///
-/// 通过 `fc-match` 命令查询，不链接 fontconfig 库。没有 `fc-match`、查询失败或给出的文件不存在
-/// 时返回 `None`。
-fn fontconfig(pattern: &str) -> Option<FontFile> {
-    let output = std::process::Command::new("fc-match")
-        .args(["--format", "%{file}\n%{postscriptname}", pattern])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let (file, postscript) = text.split_once('\n').unwrap_or((&text, ""));
-    let path = PathBuf::from(file);
-    path.is_file().then(|| FontFile {
-        path,
-        postscript: (!postscript.is_empty()).then(|| postscript.to_owned()),
-    })
-}
-
-/// 返回 fontconfig 为 `pattern` 排序的字体，最匹配的在前，最多 [`SORTED_FONTS`] 个。
-///
-/// `fc-match -s` 的结果按用户的偏好排序，排在最前的不一定含有查询的语言的文字：用户把不含
-/// 汉字的字体强制绑定到 `sans-serif` 时，它在 `lang=zh-cn` 的查询中同样排第一。没有 `fc-match`
-/// 或查询失败时返回空列表。
-fn fontconfig_sorted(pattern: &str) -> Vec<FontFile> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    let mut command = Command::new("fc-match");
-    let format = "%{file}\n%{postscriptname}\n";
-    command.args(["--sort", "--format", format, pattern]);
-    command.stdin(Stdio::null()).stdout(Stdio::piped());
-    let Ok(mut child) = command.stderr(Stdio::null()).spawn() else {
-        return Vec::new();
-    };
-    // 另起线程读输出：字体多时输出超过管道的容量，没有人读进程就不会结束。
-    let reader = child.stdout.take().map(|mut stdout| {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            stdout.read_to_string(&mut text).map(|_| text)
-        })
-    });
-    let deadline = Instant::now() + FONTCONFIG_TIMEOUT;
-    let finished = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-    let text = reader.and_then(|reader| reader.join().ok()?.ok());
-    match text {
-        Some(text) if finished => parse_sorted_fonts(&text),
-        _ => Vec::new(),
-    }
-}
-
-/// 等待 `fc-match` 的最长时间（2 秒）。
-///
-/// 查询在第一次绘制某种文字时进行，其间界面不响应。字体缓存已建好时查询在几十毫秒内结束；
-/// 超过该时间（缓存正在重建）按没有结果处理，改用内置的后备顺序。
-const FONTCONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// 解析 [`fontconfig_sorted`] 的输出：每个字体两行，依次是文件路径和 PostScript 名；只保留存在的
-/// 文件。
-fn parse_sorted_fonts(text: &str) -> Vec<FontFile> {
-    let lines: Vec<&str> = text.split('\n').collect();
-    lines
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|[path, name]| FontFile {
-            path: PathBuf::from(path),
-            postscript: (!name.is_empty()).then(|| (*name).to_owned()),
-        })
-        .filter(|font| font.path.is_file())
-        .take(SORTED_FONTS)
-        .collect()
 }
 
 /// 各字体槽位的候选字体。
@@ -1201,10 +1157,13 @@ impl Choices {
     ///
     /// 都不含 `probe` 时返回第一个能打开的字体，都打不开时返回 `None`。`shift` 是字重的偏移。
     fn open(&self, shift: i16) -> Option<Face> {
+        #[cfg(target_os = "linux")]
         let asked = self
             .query
             .as_deref()
-            .map_or_else(Vec::new, fontconfig_sorted);
+            .map_or_else(Vec::new, fontconfig::sorted);
+        #[cfg(not(target_os = "linux"))]
+        let asked = Vec::new();
         let mut first = None;
         let faces = asked.iter().chain(&self.files);
         for face in faces.filter_map(|file| Face::open_at(file, shift)) {
@@ -1268,6 +1227,7 @@ impl Candidates {
                     std::iter::once(FontFile {
                         path: PINGFANG.into(),
                         postscript: Some("PingFangSC-Regular".to_owned()),
+                        index: None,
                     })
                     .chain(paths(&[
                         "/System/Library/Fonts/Hiragino Sans GB.ttc",
@@ -1303,6 +1263,7 @@ impl Candidates {
                 math: vec![FontFile {
                     path: fonts.join("cambria.ttc"),
                     postscript: Some("CambriaMath".to_owned()),
+                    index: None,
                 }],
                 fallbacks: vec![
                     system(&["msyh.ttc", "simsun.ttc"]),
@@ -1315,52 +1276,94 @@ impl Candidates {
                 emoji: 2,
             }
         } else {
-            // Linux 先查询 fontconfig（含发行版字体位置和用户偏好），没有它的精简系统再试后面的
-            // 常见位置。等宽、界面字体启动时就要用到，同时查询；中文和 emoji 的后备字体首次用到时
-            // 再查。应用指定了语言时，等宽、界面字体也按该语言选（fontconfig 默认按系统语言选）。
-            let language = app_language().map_or_else(String::new, |lang| format!(":lang={lang}"));
-            let (asked_mono, asked_ui) = std::thread::scope(|scope| {
-                let ui = scope.spawn(|| fontconfig(&format!("sans-serif{language}")));
-                (
-                    fontconfig(&format!("monospace{language}")),
-                    ui.join().ok().flatten(),
-                )
-            });
+            // Linux 先查询 fontconfig：它记录了发行版安装字体的位置，也按用户设置的偏好选择；没有
+            // fontconfig 的精简系统再试后面这些常见的位置。等宽字体和界面字体启动时就要用到，因此
+            // 同时查询，中文和 emoji 的后备字体到第一次用到时再查。应用指定了语言时，等宽字体和
+            // 界面字体也按该语言选，因为 fontconfig 默认按系统语言选。
+            #[cfg(target_os = "linux")]
+            let (asked_mono, asked_ui) = {
+                let language =
+                    app_language().map_or_else(String::new, |lang| format!(":lang={lang}"));
+                std::thread::scope(|scope| {
+                    let ui = scope.spawn(|| {
+                        fontconfig::best(&format!("sans-serif{language}")).map(|found| found.file)
+                    });
+                    (
+                        fontconfig::best(&format!("monospace{language}")).map(|found| found.file),
+                        ui.join().ok().flatten(),
+                    )
+                })
+            };
+            #[cfg(not(target_os = "linux"))]
+            let (asked_mono, asked_ui) = (None, None);
+            #[cfg(target_os = "linux")]
+            let fontconfig_available = fontconfig::available();
+            #[cfg(not(target_os = "linux"))]
+            let fontconfig_available = false;
             mono.extend(asked_mono);
-            mono.extend(paths(&[
-                "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-                "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-                "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-            ]));
             ui_paths.extend(asked_ui);
-            ui_paths.extend(paths(&[
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                "/usr/share/fonts/TTF/DejaVuSans.ttf",
-                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-            ]));
+            // fontconfig 可用时只信它的字体集合；固定路径只在没有 fontconfig 的系统上兜底，
+            // 否则会把用户配置排除的字体又加回来。
+            if !fontconfig_available {
+                mono.extend(paths(&[
+                    "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+                    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+                ]));
+                ui_paths.extend(paths(&[
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                ]));
+            }
+            #[cfg(target_os = "linux")]
+            let math = if fontconfig_available {
+                ["STIX Two Math", "Latin Modern Math"]
+                    .iter()
+                    .filter_map(|family| {
+                        fontconfig::lookup(family, false, false).map(|found| found.file)
+                    })
+                    .collect()
+            } else {
+                paths(&[
+                    "/usr/share/fonts/opentype/stix/STIXTwoMath-Regular.otf",
+                    "/usr/share/fonts/opentype/lmodern/latinmodern-math.otf",
+                    "/usr/share/fonts/texlive-lm-math/latinmodern-math.otf",
+                ])
+            };
+            #[cfg(not(target_os = "linux"))]
+            let math = paths(&[
+                "/usr/share/fonts/opentype/stix/STIXTwoMath-Regular.otf",
+                "/usr/share/fonts/opentype/lmodern/latinmodern-math.otf",
+                "/usr/share/fonts/texlive-lm-math/latinmodern-math.otf",
+            ]);
 
             Candidates {
                 mono,
                 ui: ui_paths,
-                math: paths(&[
-                    "/usr/share/fonts/opentype/stix/STIXTwoMath-Regular.otf",
-                    "/usr/share/fonts/opentype/lmodern/latinmodern-math.otf",
-                    "/usr/share/fonts/texlive-lm-math/latinmodern-math.otf",
-                ]),
+                math,
                 fallbacks: vec![
                     Choices {
                         query: Some(format!("sans-serif:lang={}", cjk_language())),
-                        files: paths(&[
-                            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-                            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-                        ]),
+                        files: if fontconfig_available {
+                            Vec::new()
+                        } else {
+                            paths(&[
+                                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                                "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                                "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                            ])
+                        },
                         probe: Some('中'),
                     },
                     Choices {
                         query: Some("emoji".to_owned()),
-                        files: paths(&["/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"]),
+                        files: if fontconfig_available {
+                            Vec::new()
+                        } else {
+                            paths(&["/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"])
+                        },
                         probe: Some('😀'),
                     },
                 ],
