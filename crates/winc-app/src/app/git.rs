@@ -16,9 +16,11 @@ pub(crate) mod form;
 pub(crate) mod location_picker;
 pub(crate) mod log;
 pub(crate) mod merge;
+pub(crate) mod panel;
 pub(crate) mod question;
 pub(crate) mod rebase;
 mod refresh;
+mod repo_list;
 mod repository;
 pub(super) mod rewrite;
 mod stepping;
@@ -162,11 +164,21 @@ pub(crate) struct GitState {
     pub repositories: Vec<PathBuf>,
     /// 上次跟随的标签（[`App::git_follow_active`]）；只在切换标签时查找文件所在的仓库。
     followed: Option<DocumentId>,
+    /// 用户对该目录仓库列表的调整：手动添加的仓库和从列表中移除的仓库。
+    pub(crate) edits: winc_config::SessionRepositories,
+    /// 后台查找手动添加的仓库的结果，见 [`App::git_take_added`]。
+    added: Arc<Mutex<Option<repo_list::Added>>>,
+    /// 上次查找嵌套仓库时的（状态的代数，各仓库状态的版本），见
+    /// [`App::adopt_nested_repositories`]。
+    nested_seen: (u64, u64),
     /// 各仓库最近一次读取的状态；位置选择器据此显示分支和改动数，切换仓库时先显示该状态。
     summaries: Arc<Mutex<HashMap<PathBuf, Status>>>,
     /// `summaries` 每改一次加 1（后台读到新状态、切换仓库时放进、取出）：按它缓存由这些状态
     /// 排出来的东西（见 `App::commit_other_rows`）。
     summaries_version: Arc<std::sync::atomic::AtomicU64>,
+    /// 上次按其他仓库的状态更新差异标签时 `summaries_version` 的值（见
+    /// [`App::refresh_other_diffs`]）。
+    diffs_seen: u64,
     /// 各仓库最近一次读取的工作树；位置选择器据此在仓库下列出工作树。
     summary_worktrees: Arc<Mutex<HashMap<PathBuf, Vec<Worktree>>>>,
     /// 离开各仓库时记下的分支、储藏、工作树和上一次提交，切换回去时先显示。
@@ -252,6 +264,8 @@ pub(crate) struct GitState {
     pub context_row: commit::ContextRow,
     /// 日志标签的后台通道和点击区域。
     pub log: log::LogState,
+    /// 窗口底部的 Git 面板和其中的日志。
+    pub panel: panel::GitPanel,
     /// 逐行追溯（`git blame`）的状态。
     pub blame: blame::BlameState,
     /// 正在进行的分支操作。
@@ -295,8 +309,12 @@ impl Default for GitState {
             root: None,
             repositories: Vec::new(),
             followed: None,
+            edits: Default::default(),
+            added: Arc::default(),
+            nested_seen: (u64::MAX, u64::MAX),
             summaries: Arc::default(),
             summaries_version: Arc::default(),
+            diffs_seen: 0,
             summary_worktrees: Arc::default(),
             kept: HashMap::new(),
             places: std::cell::RefCell::new(None),
@@ -337,6 +355,7 @@ impl Default for GitState {
             changes: Default::default(),
             context_row: Default::default(),
             log: Default::default(),
+            panel: Default::default(),
             blame: Default::default(),
             branch: Default::default(),
             merge: Default::default(),
@@ -447,6 +466,12 @@ impl App {
         self.config.git_enabled.unwrap_or(false)
     }
 
+    /// 在打开的目录下查找仓库的层数（`git.repositoryScanDepth`）。
+    pub(crate) fn repository_scan_depth(&self) -> usize {
+        let depth = self.config.repository_scan_depth;
+        depth.unwrap_or(winc_config::Config::REPOSITORY_SCAN_DEPTH)
+    }
+
     /// 设置的 `git` 程序（`git.path`）变化后重新查找 `git`，并刷新一次。
     pub(super) fn git_program_changed(&mut self) {
         self.git.tool.forget();
@@ -459,6 +484,7 @@ impl App {
     /// 仓库由后台查找（[`App::git_scan_repositories`]）加入。
     pub(super) fn git_folder_changed(&mut self) {
         self.git.repositories.clear();
+        self.load_repository_edits();
         self.git.followed = None;
         // 切换到同一仓库的另一个工作树时，已读取的状态仍然有效，切换后可立即显示。
         let same_repository = (self.editor.root()).is_some_and(|r| self.git.shares_repository(r));
@@ -495,22 +521,23 @@ impl App {
         else {
             return;
         };
-        let depth = self
-            .config
-            .repository_scan_depth
-            .unwrap_or(winc_config::Config::REPOSITORY_SCAN_DEPTH);
+        let depth = self.repository_scan_depth();
         let cancel = Cancel::default();
         self.git.scan_running = Some(cancel.clone());
         let slot = Arc::clone(&self.git.scanned);
         let extra = self.extra_folders();
+        let added = self.git.edits.added.clone();
         self.spawn_blocking_then(UserEvent::GitStatus, move || {
-            // 本机的目录已在界面线程上查过它所在的仓库和第一层子目录（`git_discover`）；远端的
-            // 目录在这里一并查找。
-            let mut found = if winc_backend::is_remote(&dir) {
-                git::find_repositories(&dir)
-            } else {
-                Vec::new()
-            };
+            // 本机的目录已在界面线程上查过它所在的仓库、第一层子目录和手动添加的仓库
+            // （`git_discover`）；远端的目录在这里一并查找。
+            let mut found = Vec::new();
+            if winc_backend::is_remote(&dir) {
+                found = git::find_repositories(&dir);
+                let markers: Vec<PathBuf> = added.iter().map(|repo| repo.join(".git")).collect();
+                let present = winc_backend::fs::metadata_many(&markers);
+                let present = added.into_iter().zip(present).filter(|(_, m)| m.is_ok());
+                found.extend(present.map(|(repo, _)| repo));
+            }
             found.extend(git::scan_repositories(&dir, depth, &cancel));
             for folder in &extra {
                 found.extend(git::scan_repositories(folder, depth, &cancel));
@@ -545,13 +572,7 @@ impl App {
         // 这个目录的查找结束了：一个仓库都没找到时提交视图从「正在读取」换成不是仓库的说明。
         self.git.scan_running = None;
         self.request_redraw();
-        let known = self.git.repositories.len();
-        for repo in found {
-            if !self.git.repositories.contains(&repo) {
-                self.git.repositories.push(repo);
-            }
-        }
-        if self.git.repositories.len() == known {
+        if !self.git_adopt_repositories(found) {
             return;
         }
         self.git_read_summaries();
@@ -583,12 +604,18 @@ impl App {
                 }
             }
         }
-        let kept =
-            self.git.repositories.iter().filter(|repo| {
-                !found.contains(repo) && winc_backend::fs::exists(repo.join(".git"))
-            });
-        let kept: Vec<PathBuf> = kept.cloned().collect();
-        found.extend(kept);
+        // 手动添加的仓库排在查找到的之后；之前加入的仓库仍然存在时保留。移除的仓库不列出。
+        let added = self.git.edits.added.iter();
+        let earlier = added
+            .chain(self.git.repositories.iter())
+            .filter(|repo| !found.contains(repo) && winc_backend::fs::exists(repo.join(".git")));
+        let earlier: Vec<PathBuf> = earlier.cloned().collect();
+        for repo in earlier {
+            if !found.contains(&repo) {
+                found.push(repo);
+            }
+        }
+        found.retain(|repo| !self.git_repository_removed(repo));
         self.git.repositories = found;
         self.git_read_summaries();
     }
@@ -618,18 +645,34 @@ impl App {
             Some(view) => view.root.as_deref(),
             None => doc.path.as_deref().and_then(Path::parent),
         };
-        let (Some(dir), Some(folder)) = (dir, self.editor.root()) else {
+        if let Some(dir) = dir.map(Path::to_path_buf) {
+            self.git_follow_dir(&dir);
+        }
+    }
+
+    /// 文档所在的目录 `dir` 在打开的目录（或附加的目录）中的仓库里时，把当前仓库换成它；提交
+    /// 视图开着、正在提交或有没写完的提交信息时不换，只把仓库加入列表。
+    pub(in crate::app) fn git_follow_dir(&mut self, dir: &Path) {
+        let Some(folder) = self.editor.root().filter(|_| self.git_enabled()) else {
             return;
         };
-        // 目录之外的文件不改变当前仓库。
-        if !dir.starts_with(folder) {
+        // 打开的目录和附加的目录之外的文件不改变当前仓库。
+        let inside = dir.starts_with(folder)
+            || self
+                .extra_folders()
+                .iter()
+                .any(|extra| dir.starts_with(extra));
+        if !inside {
             return;
         }
         let Some(root) = git::find_root(dir) else {
             return;
         };
-        if !self.git.repositories.contains(&root) {
-            self.git.repositories.push(root.clone());
+        // 用户从列表中移除的仓库不因打开其中的文件而回来。
+        if self.git_repository_removed(&root) {
+            return;
+        }
+        if self.git_adopt_repositories([root.clone()]) {
             self.git_read_summaries();
         }
         let stay = self.panels.sidebar.view == SidebarView::Commit
@@ -645,7 +688,7 @@ impl App {
     /// 文件在仓库中的路径；不在任何已知仓库中时返回 `None`。
     ///
     /// 打开的目录里有几个仓库时不一定是当前仓库，取包含该文件的最里层那个。原路径不在已知仓库中时
-    /// 按经过符号链接解析后的路径再找一次（macOS 的 `/var` 即 `/private/var`）。
+    /// 换成文档路径的写法再找一次（见 [`winc_editor::Editor::document_path`]）。
     pub(in crate::app) fn repo_of(&self, path: &Path) -> Option<(PathBuf, PathBuf)> {
         let owner = |path: &Path| {
             let repos = self.git.repositories.iter().chain(&self.git.root);
@@ -655,7 +698,7 @@ impl App {
         if let Some(root) = owner(path) {
             return Some((root, path.to_path_buf()));
         }
-        let path = winc_config::files::canonicalize(path).ok()?;
+        let path = self.editor.document_path(path);
         Some((owner(&path)?, path))
     }
 
@@ -1021,6 +1064,7 @@ impl App {
                     }
                     if moved {
                         self.reload_logs();
+                        self.git.commit.history.outdate();
                     }
                 }
                 Err(e) => {
@@ -1056,6 +1100,9 @@ impl App {
             self.settle_commit_focus();
             self.request_redraw();
         }
+        self.refresh_other_diffs();
+        self.git_take_added();
+        self.adopt_nested_repositories();
     }
 
     /// 检查仓库配置是否会让 `git` 运行命令（[`Git::untrusted`]），必要时询问用户是否信任。

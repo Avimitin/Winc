@@ -538,6 +538,7 @@ fn a_folder_on_a_connected_host_opens_as_the_workspace() {
     files_copied_in_a_remote_tree_are_pasted_there();
     remote_items_download_to_this_computer();
     project::remote_folders_are_added_and_saved_as_a_project();
+    project::remote_project_files_open_over_the_connection();
 }
 
 /// 截图：开始页、主机面板、目录面板（浏览与筛选）和打开远端目录后的窗口。
@@ -987,7 +988,7 @@ fn folders_on_a_remote_host_are_not_taken_for_files() {
         tab: id,
         event: winc_pty::protocol::Event::Cwd(reported),
     });
-    let saved = app.terminal_session().expect("有终端标签");
+    let saved = app.terminal_session_with_tabs(&[]).expect("有终端标签");
     assert_eq!(saved.tabs, [root.join("src")]);
     app.terminal = Default::default();
 

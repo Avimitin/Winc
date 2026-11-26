@@ -125,6 +125,21 @@ impl App {
             return;
         }
 
+        // Git 面板最大化时盖在侧栏、编辑区和终端上面：面板中只有日志的菜单。
+        if self.in_git_panel(x, y) {
+            let target = if let Some((i, path)) = self.log_file_context_target(x, y) {
+                MenuTarget::LogFile(i, path)
+            } else if let Some(index) = self.log_branch_context_target(x, y) {
+                MenuTarget::BranchOps(index)
+            } else if let Some(oid) = self.log_context_target(x, y) {
+                MenuTarget::LogCommit(oid)
+            } else {
+                return;
+            };
+            self.open_context_menu(target, (x, y));
+            return;
+        }
+
         let tab = self
             .tab_at(x, y)
             .and_then(|(index, _)| self.editor.tabs().get(index));
@@ -154,6 +169,8 @@ impl App {
             MenuTarget::SearchResult(path, m)
         } else if let Some(i) = self.stash_context_target(x, y) {
             MenuTarget::StashRow(i)
+        } else if let Some(oid) = self.history_context_target(x, y) {
+            MenuTarget::HistoryCommit(oid)
         } else if let Some(path) = self.commit_context_target(x, y) {
             MenuTarget::CommitFile(path)
         } else if self.in_commit_overflow(x, y) {
@@ -171,8 +188,8 @@ impl App {
             MenuTarget::Diff(id, right)
         } else if let Some(id) = self.terminal_tab_context_target(x, y) {
             MenuTarget::TerminalTab(id)
-        } else if let Some(block) = self.terminal_context_target(x, y) {
-            MenuTarget::Terminal(block)
+        } else if let Some((id, block)) = self.terminal_context_target(x, y) {
+            MenuTarget::Terminal(id, block)
         } else if self.markdown_context_target(x, y) {
             MenuTarget::Markdown
         } else if self.combined_active() && self.layout.editor.contains(x, y) {
@@ -309,7 +326,7 @@ impl App {
     /// 右键点在终端的标签上：它成为正在看的标签，返回它的编号。
     fn terminal_tab_context_target(&mut self, x: f32, y: f32) -> Option<u16> {
         use crate::app::terminal::HeaderHit;
-        let index = match crate::layout::hit(&self.hits.terminal, x, y)? {
+        let index = match crate::layout::hit(self.terminal_hits_at(x, y), x, y)? {
             HeaderHit::Tab(i) | HeaderHit::Close(i) => i,
             // 拆分出的终端：先换到前台，菜单作用于它。
             HeaderHit::Pane(i, at) | HeaderHit::ClosePane(i, at) => {
@@ -326,16 +343,15 @@ impl App {
     /// 右键点在终端面板的网格上（标签栏以下）：焦点给终端，弹终端的菜单；返回点着的命令块。
     ///
     /// 程序要了鼠标时右键已经上报给程序了，到不了这里（按着 `⇧` 时才到）。
-    fn terminal_context_target(&mut self, x: f32, y: f32) -> Option<Option<u32>> {
-        let card = self.layout.terminal;
-        let hit = card.contains(x, y)
-            && y >= card.y + crate::app::terminal::header_height(card)
+    fn terminal_context_target(&mut self, x: f32, y: f32) -> Option<(u16, Option<u32>)> {
+        let hit = self.terminal_contains(x, y)
+            && y >= self.terminal_view().y
             && self.terminal.tab().is_some();
         if !hit {
             return None;
         }
         self.focus = Focus::Terminal;
-        Some(self.terminal_block_under(x, y))
+        Some((self.terminal.tab()?.id, self.terminal_block_under(x, y)))
     }
 
     /// 为 `target` 生成菜单项，并在窗口坐标 `at`（逻辑像素）处弹出系统菜单。
@@ -345,6 +361,11 @@ impl App {
         // 提交菜单里的操作都在日志所在的仓库里做：先换到这个仓库，菜单按它的分支列出。
         if matches!(target, MenuTarget::LogCommit(_)) {
             self.follow_log_root();
+        }
+        if let MenuTarget::Terminal(id, _) | MenuTarget::TerminalTab(id) = &target
+            && self.activate_terminal_menu_target(*id).is_none()
+        {
+            return;
         }
         let entries = match &target {
             &MenuTarget::AddLanguage(task) => {
@@ -367,6 +388,9 @@ impl App {
             MenuTarget::OpenWorktree => open_worktree_menu(),
             MenuTarget::PullMode => (0..winc_config::PullMode::ALL.len())
                 .map(|i| MenuEntry::Item(MenuCommand::PullMode(i), true))
+                .collect(),
+            MenuTarget::LogPlacement => (0..winc_config::LogPlacement::ALL.len())
+                .map(|i| MenuEntry::Item(MenuCommand::LogPlacement(i), true))
                 .collect(),
             MenuTarget::SearchStyle => (0..winc_config::SearchStyle::ALL.len())
                 .map(|i| MenuEntry::Item(MenuCommand::SearchStyle(i), true))
@@ -480,6 +504,7 @@ impl App {
                     !doc.selection.is_empty(),
                     bookmarked,
                     markdown,
+                    doc.path.is_some(),
                 );
                 // 光标在链接上时第一项是「打开链接」。
                 if self.link_at_caret().is_some() {
@@ -588,6 +613,7 @@ impl App {
                     move_group_command(self.terminal_right()),
                     self.terminal_movable_to_group(),
                 ),
+                MenuEntry::Item(MenuCommand::MoveTerminalToEditor, true),
                 MenuEntry::Separator,
                 MenuEntry::Item(MenuCommand::CloseTerminal, true),
                 MenuEntry::Item(
@@ -595,7 +621,7 @@ impl App {
                     self.terminal.tabs.len() > 1,
                 ),
             ],
-            &MenuTarget::Terminal(block) => {
+            &MenuTarget::Terminal(_, block) => {
                 let Some(tab) = self.terminal.tab() else {
                     return;
                 };
@@ -605,7 +631,28 @@ impl App {
                     Some((!b.text.is_empty(), self.terminal_can_rerun(id)))
                 });
                 let group = (self.terminal_right(), self.terminal_movable_to_group());
-                terminal_menu(tab.selection_range().is_some(), running, block, group)
+                let mut menu =
+                    terminal_menu(tab.selection_range().is_some(), running, block, group);
+                if self.terminal.editor_at(self.terminal.group_at).is_some() {
+                    menu.retain(|entry| {
+                        !matches!(
+                            entry,
+                            MenuEntry::Item(
+                                MenuCommand::TerminalMaximize | MenuCommand::TerminalDock,
+                                _
+                            )
+                        )
+                    });
+                    menu.dedup_by(|a, b| {
+                        matches!((a, b), (MenuEntry::Separator, MenuEntry::Separator))
+                    });
+                    for entry in &mut menu {
+                        if let MenuEntry::Item(MenuCommand::MoveTerminalToEditor, _) = entry {
+                            *entry = MenuEntry::Item(MenuCommand::MoveTerminalToPanel, true);
+                        }
+                    }
+                }
+                menu
             }
             &MenuTarget::Diff(id, right) => {
                 if self.editor.active().map(|d| d.id) != Some(id) {
@@ -646,6 +693,13 @@ impl App {
                     docs.iter().any(|d| !d.is_dirty()),
                 );
                 let doc = &docs[index];
+                if doc.terminal {
+                    menu.extend([
+                        MenuEntry::Separator,
+                        MenuEntry::Item(MenuCommand::RenameTerminal, true),
+                        MenuEntry::Item(MenuCommand::MoveTerminalToPanel, true),
+                    ]);
+                }
                 if doc.can_lock() && doc.shows_text() {
                     let command = MenuCommand::ReadOnly(!doc.is_locked());
                     menu.extend([MenuEntry::Separator, MenuEntry::Item(command, true)]);
@@ -786,16 +840,17 @@ impl App {
             MenuTarget::LogFile(_, path) => {
                 log_file_menu(self.may_exist(path), self.relative_path(path).is_some())
             }
-            MenuTarget::LogCommit(oid) => {
-                let commit = self.log_commit(oid);
+            MenuTarget::LogCommit(oid) | MenuTarget::HistoryCommit(oid) => {
+                let in_log = matches!(target, MenuTarget::LogCommit(_));
+                let commit = self.log_commit(oid, in_log);
                 let tags: Vec<&str> = (commit.iter().flat_map(|c| &c.refs))
                     .filter_map(crate::app::git::log::menus::tag_name)
                     .collect();
                 // 指向这个提交的分支，各自的操作与分支面板中相同；分支列表属于提交视图所在的
-                // 仓库，还没换过去（日志没有仓库）时不列出。
+                // 仓库，还没换过去（日志没有仓库）时不列出；提交历史就在该仓库中。
                 let (held, stale) = (self.git.held_branches(), self.git.stale_branches());
                 let all = &self.git.branches;
-                let same = self.active_log_root() == self.git.root.as_deref();
+                let same = !in_log || self.active_log_root() == self.git.root.as_deref();
                 let branches = (commit.iter().filter(|_| same).flat_map(|c| &c.refs))
                     .filter_map(|r| match r {
                         Ref::Head(name) | Ref::Branch(name) => {
@@ -811,7 +866,7 @@ impl App {
                         (all[i].name.clone(), ops)
                     })
                     .collect();
-                let actions = self.log_commit_actions(oid);
+                let actions = self.log_commit_actions(oid, in_log);
                 log_commit_menu(actions, &self.current_branch_label(), branches, &tags)
             }
             MenuTarget::LogColumns => self.log_columns_menu(),
@@ -860,7 +915,7 @@ impl App {
             | MenuTarget::DiffGutter(..)
             | MenuTarget::Markdown
             | MenuTarget::LogCommit(_) => Context::Editor,
-            MenuTarget::Terminal(_) | MenuTarget::TerminalTab(_) => Context::Terminal,
+            MenuTarget::Terminal(..) | MenuTarget::TerminalTab(_) => Context::Terminal,
             MenuTarget::SearchResult(..) => Context::Panel,
             MenuTarget::CommitFile(_) => Context::Changes,
             _ => Context::Other,
@@ -880,6 +935,7 @@ impl App {
                 | MenuTarget::VimKey(_)
                 | MenuTarget::OpenWorktree
                 | MenuTarget::PullMode
+                | MenuTarget::LogPlacement
                 | MenuTarget::DropFolder
                 | MenuTarget::SearchStyle
                 | MenuTarget::AutoSave
@@ -902,6 +958,7 @@ impl App {
             MenuTarget::VimKey(c) => Some(Setting::VimKey(c)),
             MenuTarget::OpenWorktree => Some(Setting::GitOpenWorktree),
             MenuTarget::PullMode => Some(Setting::GitPullMode),
+            MenuTarget::LogPlacement => Some(Setting::GitLogPlacement),
             MenuTarget::DropFolder => Some(Setting::DropFolder),
             MenuTarget::SearchStyle => Some(Setting::FindInFiles),
             MenuTarget::AutoSave => Some(Setting::AutoSave),
@@ -926,7 +983,9 @@ impl App {
             MenuTarget::BranchOps(_) | MenuTarget::CommitMore => {
                 (self.git.branches.clone(), self.git.stashes.clone())
             }
-            MenuTarget::LogCommit(_) => (self.git.branches.clone(), Vec::new()),
+            MenuTarget::LogCommit(_) | MenuTarget::HistoryCommit(_) => {
+                (self.git.branches.clone(), Vec::new())
+            }
             MenuTarget::StashRow(_) | MenuTarget::StashList => {
                 (Vec::new(), self.git.stashes.clone())
             }
@@ -1110,11 +1169,7 @@ impl App {
             return self.markdown_line_numbers_on();
         }
         // 日志的作者筛选：现在用着的那一项。
-        let query = self
-            .editor
-            .active()
-            .and_then(|d| d.log.as_deref())
-            .map(|v| &v.query);
+        let query = self.log_view().map(|v| &v.query);
         if let MenuCommand::FormBase(i) = command {
             return self.form_base_chosen(i);
         }
@@ -1210,6 +1265,10 @@ impl App {
             }
             MenuCommand::PullMode(i) => {
                 winc_config::PullMode::ALL.get(i) == Some(&self.config.git_pull.unwrap_or_default())
+            }
+            MenuCommand::LogPlacement(i) => {
+                let current = self.config.git_log_placement.unwrap_or_default();
+                winc_config::LogPlacement::ALL.get(i) == Some(&current)
             }
             MenuCommand::SearchStyle(i) => {
                 winc_config::SearchStyle::ALL.get(i) == Some(&self.search_style())
@@ -1343,6 +1402,13 @@ impl App {
                         (x + w / 2.0, y + h / 2.0),
                         1.0,
                         self.palette.accent,
+                        clip,
+                    );
+                } else if doc.terminal {
+                    icons::terminal(
+                        frame,
+                        (x + w / 2.0, y + h / 2.0),
+                        self.palette.text_muted,
                         clip,
                     );
                 } else {

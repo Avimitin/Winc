@@ -72,7 +72,11 @@ pub(crate) fn base(app: &App) -> [(Rect, Color); 3] {
 
 /// 绘制编辑区；差异和日志的点击区域裁剪在编辑区内，包括终端最大化后的零宽、零高区域。
 fn draw_editor(app: &mut App, frame: &mut Frame<'_>) {
-    editor::draw_editor(app, frame);
+    if app.editor.active().is_some_and(|doc| doc.terminal) {
+        terminal::draw_editor_terminal(app, frame);
+    } else {
+        editor::draw_editor(app, frame);
+    }
     for (rect, _) in &mut app.hits.diff {
         *rect = rect.intersect(app.layout.editor);
     }
@@ -108,6 +112,18 @@ fn draw_pane_dividers(app: &App, frame: &mut Frame<'_>) {
 /// 标签栏上时画出插入处的竖线。
 fn draw_tab_drop(app: &App, frame: &mut Frame<'_>) {
     use crate::app::workspace::panes::TabDrop;
+    if let Some((drop, area)) = app.editor_terminal_panel_drop(&app.tabs_dragged_out()) {
+        if matches!(
+            drop,
+            crate::app::terminal::groups::GroupDrop::Into { at: Some(_), .. }
+        ) {
+            frame.rect(area, app.palette.accent);
+        } else {
+            let area = area.inset(6.0, 6.0);
+            frame.rect_clipped(area, app.palette.drop_target, RADIUS_ISLAND - 4.0, area);
+        }
+        return;
+    }
     match app.panes.drop {
         Some((TabDrop::Into { at: Some(_), .. }, line)) => {
             frame.rect(line, app.palette.accent);
@@ -170,11 +186,20 @@ pub fn draw(app: &mut App, frame: &mut Frame<'_>) {
         round_editor_corners(app, frame);
     }
     terminal::draw_terminal(app, frame);
+    // 最大化的 Git 面板盖在侧栏和编辑区上面：两者的圆角先修整好，面板再画在上面。
+    let git_full = app.git.panel.full && app.git_panel_shown();
+    if git_full {
+        round_editor_corners(app, frame);
+        if layout.sidebar.right() > 0.0 {
+            frame.round_corners(layout.sidebar, RADIUS_ISLAND, app.palette.frame_bg);
+        }
+    }
+    git::panel::draw_git_panel(app, frame);
     // 侧栏开关和窗口按钮画在终端之上：面板在右边、最大化且侧栏收起时伸到它们下面。
     draw_sidebar_button(app, frame);
     draw_window_controls(app, frame);
     draw_status(app, frame);
-    draw_island_corners(app, frame, !covered);
+    draw_island_corners(app, frame, !covered && !git_full, !git_full);
     // 以下都是浮在内容之上的面板、菜单和提示，底色保持不透明。
     frame.end_wallpaper();
     draw_file_drop(app, frame);
@@ -303,12 +328,13 @@ fn draw_modal(app: &mut App, frame: &mut Frame<'_>) {
 /// 把侧栏、编辑区（以及终端面板）的四角改为圆角。
 ///
 /// 卡片内容按直角矩形绘制，最后用窗口底色覆盖四角圆弧外侧的部分；之后绘制的浮层不受影响。
-/// `editor` 为假时不修整编辑区：终端面板正盖在它上面，它的圆角已在面板之前修整过。
-fn draw_island_corners(app: &App, frame: &mut Frame<'_>, editor: bool) {
+/// `editor`、`sidebar` 为假时不修整编辑区、侧栏：最大化的面板正盖在它上面，它的圆角已在面板
+/// 之前修整过。
+fn draw_island_corners(app: &App, frame: &mut Frame<'_>, editor: bool, sidebar: bool) {
     let l = &app.layout;
     let p = app.palette;
 
-    if l.sidebar.right() > 0.0 {
+    if sidebar && l.sidebar.right() > 0.0 {
         frame.round_corners(l.sidebar, RADIUS_ISLAND, p.frame_bg);
     }
     if editor {
@@ -316,6 +342,9 @@ fn draw_island_corners(app: &App, frame: &mut Frame<'_>, editor: bool) {
     }
     if l.terminal.h > 0.0 {
         frame.round_corners(l.terminal, RADIUS_ISLAND, p.frame_bg);
+    }
+    if l.git_panel.h > 0.0 {
+        frame.round_corners(l.git_panel, RADIUS_ISLAND, p.frame_bg);
     }
 }
 
@@ -377,8 +406,16 @@ fn draw_tab_drag(app: &App, frame: &mut Frame<'_>) {
         1 => ellipsize(frame, &file, app.fonts.ui, 240.0),
         n => Cow::Owned(t!("workspace-tree-drag-items", count = n)),
     };
-    let (card, icon_x, cy) = draw_drag_card(app, frame, name);
-    draw_file_icon(frame, app.palette, (icon_x + 1.5, cy), &file, card);
+    let (card, icon_x, cy) = if doc.terminal {
+        draw_move_card(app, frame, &name)
+    } else {
+        draw_drag_card(app, frame, name)
+    };
+    if doc.terminal {
+        icons::terminal(frame, (icon_x + 6.0, cy), app.palette.text_muted, card);
+    } else {
+        draw_file_icon(frame, app.palette, (icon_x + 1.5, cy), &file, card);
+    }
 }
 
 /// 在鼠标右下方画拖动时的卡片和名称 `name`（按住 `⌥` 时注明复制），返回卡片、图标的横坐标和
@@ -1097,6 +1134,17 @@ fn fade_up(frame: &mut Frame<'_>, rect: Rect, color: Color) {
 
     for i in 0..steps {
         let t = (i as f32 + 0.5) / steps as f32;
+        let strip = Rect::new(rect.x, rect.y + i as f32, rect.w, 1.0);
+        frame.rect(strip, color.alpha(color.a * t * t));
+    }
+}
+
+/// 绘制纵向渐隐：从 `rect` 上端的 `color` 渐变到下端的透明，与 [`fade_up`] 方向相反。
+fn fade_down(frame: &mut Frame<'_>, rect: Rect, color: Color) {
+    let steps = rect.h.round().max(1.0) as usize;
+
+    for i in 0..steps {
+        let t = 1.0 - (i as f32 + 0.5) / steps as f32;
         let strip = Rect::new(rect.x, rect.y + i as f32, rect.w, 1.0);
         frame.rect(strip, color.alpha(color.a * t * t));
     }

@@ -895,7 +895,7 @@ fn the_about_page_shows_the_version_and_the_update_state() {
         assert!(layout.row(setting).is_some(), "{setting:?}");
     }
     assert_eq!(Setting::CheckUpdates.page(), SettingsPage::General);
-    // 顶部是产品信息：图标、名称和版本号；点击版本号复制到剪贴板，点击图标没有反应。
+    // 顶部是产品信息：图标、名称和版本号；点击版本号复制版本信息，点击图标没有反应。
     let row = layout.row(Setting::Version).unwrap().row;
     let parts = crate::layout::ProductParts::new(row);
     let center = |r: Rect| (r.x + r.w / 2.0, r.y + r.h / 2.0);
@@ -907,10 +907,11 @@ fn the_about_page_shows_the_version_and_the_update_state() {
     let (x, y) = center(parts.logo);
     assert_eq!(layout.part_at(x, y), None);
     click_part(&mut app, SettingsPart::Copy(Setting::Version));
-    assert_eq!(
-        app.clipboard.copied.as_deref(),
-        Some(&*crate::layout::version_label())
-    );
+    let copied = app.clipboard.copied.clone().unwrap();
+    let first = format!("Winc {}", crate::layout::version_label());
+    assert_eq!(copied.lines().next(), Some(first.as_str()));
+    assert_eq!(copied.lines().count(), 2, "第二行是系统");
+    assert_eq!(app.status.message.as_deref(), Some("已复制版本信息"));
     assert_eq!(app.settings.selected, Setting::Version);
 
     // 当前版本不检查更新时按钮点击没有反应；能检查时点击交给 Sparkle（测试里不启用）。
@@ -1205,8 +1206,11 @@ fn the_git_page_is_listed_only_when_the_module_is_on() {
     let expected = [
         Setting::GitPath,
         Setting::GitOpenWorktree,
+        Setting::GitLogPlacement,
+        Setting::GitScanDepth,
         Setting::GitStagingArea,
         Setting::GitTree,
+        Setting::GitCommitHistory,
         Setting::GitCombinedDiff,
         Setting::DiffInline,
         Setting::DiffCollapse,

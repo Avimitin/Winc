@@ -46,22 +46,18 @@ body:
         - Windows
     validations:
       required: true
-  - type: input
-    id: system
+  - type: textarea
+    id: environment
     attributes:
-      label: System version
+      label: Version and system information
       description: >-
-        The system version, and the desktop environment on Linux. For SSH remote or WSL problems,
-        also name the system of the remote host or the distribution.
-      placeholder: "macOS 15.1 / Ubuntu 24.04, GNOME on Wayland / Windows 11 23H2"
-    validations:
-      required: true
-  - type: input
-    id: version
-    attributes:
-      label: Version
-      description: Shown in Settings → About, or by running `winc --version`.
-      placeholder: "0.1.970"
+        In winc, open Settings → About and click the version number to copy this information,
+        then paste it here. If winc cannot start, enter the version (`winc --version`), the system
+        version and, on Linux, the desktop environment and whether it uses Wayland or X11. For SSH
+        remote or WSL problems, also name the system of the remote host or the distribution.
+      placeholder: |
+        Winc 0.1.970 (arm64)
+        macOS 15.1 (24B83)
     validations:
       required: true
   - type: dropdown

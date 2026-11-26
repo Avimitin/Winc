@@ -3,6 +3,8 @@
 
 use winc_editor::{PreviewMode, TableState};
 
+mod split;
+
 use super::*;
 
 /// 把 `files`（包中路径，内容）原样存成 zip 文件并返回字节，不压缩、CRC 写 0。

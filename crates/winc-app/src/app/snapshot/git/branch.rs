@@ -155,6 +155,13 @@ fn branch_menu_creates_switches_pushes_and_deletes() {
     git_in(&root, &["push", "-q", "origin", "main:topic"]);
     app.run_branch_command(MenuCommand::GitFetch);
     let topic = index_of(&app, "origin/topic");
+    // 复制远程分支的名字时带着远程名，和列表里显示的一致。
+    choose_in_branch_menu(&mut app, MenuCommand::GitBranch(BranchOp::CopyName, topic));
+    assert_eq!(app.clipboard_text().as_deref(), Some("origin/topic"));
+    assert_eq!(
+        app.status.message.as_deref(),
+        Some("已复制分支名「origin/topic」")
+    );
     choose_in_branch_menu(&mut app, MenuCommand::GitBranch(BranchOp::Checkout, topic));
     assert_eq!(head(&app), "topic");
     paint(&mut app);

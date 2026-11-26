@@ -429,6 +429,26 @@ pub const EDIT_LIMIT: u64 = 16 << 20;
 /// 跨过这一距离，起始位置以上 256 行内没有未闭合的块注释或字符串时结果才与从头推算相同。
 const HIGHLIGHT_LOOKBACK: usize = 256;
 
+/// 返回文字 `text` 中各行 `lines`（从 0 起，从小到大）行首的高亮状态，按 `language` 推算；供
+/// 不打开文件、只显示其中几行的预览和搜索结果使用。
+///
+/// 从文件开头推算，结果与打开文件后相同，各行共用推算的结果；推算到某一行要再推算的行数超过
+/// `budget` 时，该行从上方 `HIGHLIGHT_LOOKBACK` 行处推算，与打开大文件时相同。
+pub fn line_highlight_states(
+    text: &ropey::Rope,
+    language: &'static winc_syntax::Language,
+    lines: &[usize],
+    budget: usize,
+) -> Vec<LineState> {
+    let mut highlighter = Highlighter::new(language);
+    (lines.iter())
+        .map(|&line| {
+            (highlighter.state_at(text, line, budget))
+                .unwrap_or_else(|| highlighter.state_near(text, line, HIGHLIGHT_LOOKBACK))
+        })
+        .collect()
+}
+
 /// 粘滞滚动每帧最多向后推算的高亮行数（行，4000）。
 ///
 /// 与编辑区绘制时的每帧预算取同一个值：推算不完时本次结果不缓存，下一帧重新计算。该值取自调参，
@@ -493,6 +513,8 @@ pub struct Document {
     pub log: Option<Box<crate::git::log::LogView>>,
     /// 编辑区按十六进制显示文件的字节，而不是文本；只读，文本为空。
     pub hex: Option<Box<crate::hex::HexView>>,
+    /// 编辑区显示终端而不是文本；会话由界面层管理，没有对应的文件。
+    pub terminal: bool,
     /// 切换到预览之前的 `readonly`：SVG 的预览期间强制只读，切回源代码时恢复该值。
     readonly_before_preview: bool,
     /// 分栏预览（`PreviewMode::Split`）：文本仍然显示，右侧的预览由界面管理。
@@ -568,6 +590,8 @@ pub struct Document {
     pending_as_text: bool,
     /// 尚未读取的文档读取时是否打开成十六进制视图。
     pending_hex: bool,
+    /// 尚未读取的文档读取时文件不存在是否成为新文件（见 `Document::new_file`）。
+    pending_new: bool,
     /// 用户通过「通过编码重新打开」选的编码：之后从磁盘重新读取时按它解码，不再识别编码，也不
     /// 再判断是否二进制。
     chosen: Option<Encoding>,
@@ -625,6 +649,7 @@ impl Document {
             diff: None,
             log: None,
             hex: None,
+            terminal: false,
             readonly_before_preview: false,
             split: false,
             rendered: false,
@@ -659,6 +684,7 @@ impl Document {
             pending: false,
             pending_as_text: false,
             pending_hex: false,
+            pending_new: false,
             chosen: None,
             escape_origin: None,
         }
@@ -704,7 +730,7 @@ impl Document {
     ///
     /// 当前内容作为保存基线：不修改时关闭不询问是否保存。不是输出标签时不做处理。
     pub fn make_untitled(&mut self) {
-        if self.reading.is_some() || self.diff.is_some() || self.log.is_some() {
+        if self.reading.is_some() || self.diff.is_some() || self.log.is_some() || self.terminal {
             return;
         }
         if let Some(title) = self.title.take() {
@@ -759,6 +785,15 @@ impl Document {
         document.title = Some(title.to_owned());
         document.readonly = true;
         document.log = Some(Box::new(view));
+        document
+    }
+
+    /// 创建终端标签，标题为 `title`；没有文本和文件，会话由界面层管理。
+    pub fn terminal(id: DocumentId, title: &str) -> Self {
+        let mut document = Self::empty(id);
+        document.title = Some(title.to_owned());
+        document.readonly = true;
+        document.terminal = true;
         document
     }
 

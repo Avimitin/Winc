@@ -195,7 +195,7 @@ impl SettingsPage {
                 ),
                 group(
                     t!("settings-group-sidebar"),
-                    vec![S::CompactFolders, S::Outline, S::FindInFiles],
+                    vec![S::CompactFolders, S::AutoReveal, S::Outline, S::FindInFiles],
                 ),
             ],
             SettingsPage::Markdown => vec![
@@ -253,11 +253,16 @@ impl SettingsPage {
             SettingsPage::Git => vec![
                 group(
                     t!("settings-group-general"),
-                    vec![S::GitPath, S::GitOpenWorktree],
+                    vec![
+                        S::GitPath,
+                        S::GitOpenWorktree,
+                        S::GitLogPlacement,
+                        S::GitScanDepth,
+                    ],
                 ),
                 group(
                     t!("settings-group-commit"),
-                    vec![S::GitStagingArea, S::GitTree],
+                    vec![S::GitStagingArea, S::GitTree, S::GitCommitHistory],
                 ),
                 group(
                     t!("settings-group-diff"),

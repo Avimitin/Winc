@@ -78,6 +78,7 @@ impl App {
             self.pointer.drag,
             Drag::Splitter { .. }
                 | Drag::TerminalDivider { .. }
+                | Drag::GitPanelDivider { .. }
                 | Drag::SplitDivider { .. }
                 | Drag::PaneDivider { .. }
                 | Drag::TerminalSplit { .. }
@@ -154,8 +155,14 @@ impl App {
             self.with_pane(pane, wheel);
             self.refresh_pointer_hover();
             self.request_redraw();
-        } else if let Some(at) = self.terminal_pane_at(x, y) {
-            self.with_terminal_pane(at, wheel);
+        } else if let Some(group) = self.terminal_group_at(x, y) {
+            self.with_terminal_group(group, |app| {
+                if let Some(at) = app.terminal_pane_at(x, y) {
+                    app.with_terminal_pane(at, wheel);
+                } else {
+                    wheel(app);
+                }
+            });
             self.request_redraw();
         } else {
             wheel(self);

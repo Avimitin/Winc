@@ -49,12 +49,15 @@ impl App {
             MenuTarget::Tab(id) => self.run_tab_command(command, id),
             MenuTarget::CommitFile(path) => self.run_commit_file_command(command, path),
             // 提交上的分支子菜单：分支按弹出菜单时的列表解释。
-            MenuTarget::LogCommit(_) if let MenuCommand::GitBranch(op, i) = command => {
+            MenuTarget::LogCommit(_) | MenuTarget::HistoryCommit(_)
+                if let MenuCommand::GitBranch(op, i) = command =>
+            {
                 if let Some(branch) = menu.branches.get(i).cloned() {
                     self.run_branch_op(op, branch);
                 }
             }
-            MenuTarget::LogCommit(oid) => self.run_log_commit_command(command, &oid),
+            MenuTarget::LogCommit(oid) => self.run_log_commit_command(command, &oid, true),
+            MenuTarget::HistoryCommit(oid) => self.run_log_commit_command(command, &oid, false),
             MenuTarget::LogFile(i, path) => self.run_log_file_command(command, i, path),
             MenuTarget::SearchResult(path, m) => self.run_search_result_command(command, path, m),
             // 分支、储藏的下标按弹出菜单时的列表解释：菜单打开期间状态刷新后，
@@ -146,9 +149,13 @@ impl App {
                 }
                 _ => {}
             },
-            MenuTarget::Terminal(block) => self.run_terminal_command(command, block),
+            MenuTarget::Terminal(id, block) => {
+                if self.activate_terminal_menu_target(id).is_some() {
+                    self.run_terminal_command(command, block);
+                }
+            }
             MenuTarget::TerminalTab(id) => {
-                let Some(index) = self.terminal.tabs.iter().position(|t| t.id == id) else {
+                let Some(index) = self.activate_terminal_menu_target(id) else {
                     return;
                 };
                 match command {
@@ -161,6 +168,7 @@ impl App {
                         self.activate_terminal_tab(index);
                         self.move_terminal_to_new_group();
                     }
+                    MenuCommand::MoveTerminalToEditor => self.move_terminal_to_editor(),
                     MenuCommand::CloseTerminal => self.close_terminal_tab(index),
                     MenuCommand::CloseOtherTerminals => self.close_other_terminal_tabs(id),
                     _ => {}
@@ -276,6 +284,13 @@ impl App {
                     && let Some(&choice) = winc_config::WorktreeOpen::ALL.get(i)
                 {
                     self.set_open_worktree(choice);
+                }
+            }
+            MenuTarget::LogPlacement => {
+                if let MenuCommand::LogPlacement(i) = command
+                    && let Some(&choice) = winc_config::LogPlacement::ALL.get(i)
+                {
+                    self.set_log_placement(choice);
                 }
             }
             MenuTarget::PullMode => {
@@ -419,6 +434,7 @@ impl App {
                     self.close_picker();
                     self.prune_worktrees();
                 }
+                MenuCommand::LocationForget => self.remove_repository(&path),
                 MenuCommand::LocationMerge => {
                     let tree = worktree.and_then(|i| self.git.worktrees.get(i));
                     if let Some(name) = tree.and_then(|w| w.branch()).map(str::to_owned) {
@@ -546,6 +562,25 @@ impl App {
         }
     }
 
+    /// 菜单目标编号优先于当前焦点，包括其他栏和拆分出的终端。
+    pub(super) fn activate_terminal_menu_target(&mut self, id: u16) -> Option<usize> {
+        let group = self.terminal.group_of(id)?;
+        self.focus_terminal_group(group);
+        let index = self
+            .terminal
+            .tabs
+            .iter()
+            .position(|tab| tab.panes().any(|pane| pane.id == id))?;
+        let tab = &self.terminal.tabs[index];
+        let offset = tab.panes().position(|pane| pane.id == id)?;
+        let pane = match offset {
+            0 => tab.pane_at(),
+            n => n - 1 + usize::from(n > tab.pane_at()),
+        };
+        self.select_terminal_pane(index, pane);
+        Some(index)
+    }
+
     fn run_terminal_command(&mut self, command: MenuCommand, block: Option<u32>) {
         match (command, block) {
             (MenuCommand::CopyCommand, Some(id)) => return self.copy_terminal_command(id),
@@ -566,6 +601,8 @@ impl App {
             MenuCommand::MoveTerminalRight | MenuCommand::MoveTerminalDown => {
                 self.move_terminal_to_new_group();
             }
+            MenuCommand::MoveTerminalToEditor => self.move_terminal_to_editor(),
+            MenuCommand::MoveTerminalToPanel => self.move_terminal_to_panel(),
             MenuCommand::CloseTerminal => self.close_terminal_pane(),
             _ => {}
         }
@@ -590,6 +627,10 @@ impl App {
             MenuCommand::Format => self.format_active(),
             MenuCommand::FormatSelection => self.format_selection(),
             MenuCommand::Fix => self.fix_active(),
+            MenuCommand::CompareWithClipboard | MenuCommand::CompareSelectionWithClipboard => {
+                self.compare_with_clipboard()
+            }
+            MenuCommand::CompareWithSaved => self.compare_with_saved(),
             MenuCommand::GoToDefinition => self.go_to_definition(),
             MenuCommand::OpenLink => self.open_caret_link(),
             MenuCommand::FindReferences => self.find_references(),
@@ -602,6 +643,22 @@ impl App {
     }
 
     fn run_tab_command(&mut self, command: MenuCommand, id: DocumentId) {
+        if self.editor.document(id).is_some_and(|doc| doc.terminal) {
+            match command {
+                MenuCommand::MoveTerminalToPanel => {
+                    self.move_editor_terminal_to_panel(id);
+                    return;
+                }
+                MenuCommand::RenameTerminal => {
+                    self.focus_editor_terminal_document(id);
+                    if self.activate_editor_terminal() {
+                        self.open_terminal_rename(self.terminal.active);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         let Some(index) = self
             .editor
             .index_of(id)
@@ -821,12 +878,16 @@ impl App {
 
     /// 让全局搜索只搜索 `path` 所在的目录（`path` 是文件时取该文件所在的目录）。
     ///
-    /// 把「包含」填成 `./相对路径`，并展开过滤条件。
+    /// 把「包含」填成 `./相对路径`，并展开过滤条件。Windows 上路径中的 `\` 换成 `/`：规则按 glob
+    /// 解析，各系统上填入的写法相同。
     pub(in crate::app) fn find_in_folder(&mut self, path: &Path) {
         let dir = self.folder_of(path);
         let include = self
             .relative_path(&dir)
-            .map(|relative| format!("./{relative}"))
+            .map(|relative| match cfg!(windows) {
+                true => format!("./{}", relative.replace('\\', "/")),
+                false => format!("./{relative}"),
+            })
             .unwrap_or_default();
 
         if include != self.panels.global.include.text() {
