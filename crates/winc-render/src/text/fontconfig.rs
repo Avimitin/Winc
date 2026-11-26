@@ -68,9 +68,9 @@ fn current() -> Option<&'static Fontconfig> {
 
 /// 返回 fontconfig 对 `pattern`（模式写法，如 `monospace:lang=zh-cn`）的最佳匹配。
 pub(super) fn best(pattern: &str) -> Option<Match> {
-    let mut pattern = raw::parse(current()?, pattern)?;
-    let found = pattern.font_match().ok()?;
-    Match::from_pattern(&found)
+    let config = current()?;
+    let mut pattern = raw::parse(config, pattern)?;
+    Match::from_pattern(&raw::font_match(config, &mut pattern)?)
 }
 
 /// 返回 fontconfig 为 `pattern` 排序的字体，最匹配的在前，最多 [`SORTED_FONTS`] 个。
@@ -127,8 +127,9 @@ pub(super) fn lookup(family: &str, bold: bool, italic: bool) -> Option<Match> {
     if family.is_empty() {
         return None;
     }
-    let mut matching = request(current()?, family, bold, italic)?;
-    let found = Match::from_pattern(&matching.font_match().ok()?)?;
+    let config = current()?;
+    let mut matching = request(config, family, bold, italic)?;
+    let found = Match::from_pattern(&raw::font_match(config, &mut matching)?)?;
     if is_generic(family) || names_family(&found.families, family) {
         return Some(found);
     }
@@ -235,16 +236,16 @@ fn families_added(requested: &[String], probe: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 安全接口不提供，或只返回 UTF-8 字符串的 fontconfig 调用。
+/// 安全接口不提供、只返回 UTF-8 字符串，或引用计数有误的 fontconfig 调用。
 ///
-/// 除 `FcNameParse` 返回的新模式外都是只读查询，不转移所有权。
+/// 除 `FcNameParse`、`FcFontMatch` 返回的新模式外都是只读查询，不转移所有权。
 // 本模块的 `unsafe` 仅用于调用 libfontconfig 的 C 函数，不扩散到其他模块。
 #[allow(unsafe_code)]
 mod raw {
     use std::ffi::{CStr, CString, c_char, c_int};
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
-    use std::ptr;
+    use std::ptr::{self, NonNull};
 
     use ::fontconfig::{FC_FAMILY, FC_FILE, FC_POSTSCRIPT_NAME, Fontconfig, Pattern};
     use fontconfig_sys as sys;
@@ -260,14 +261,44 @@ mod raw {
         let pattern = CString::new(pattern).ok()?;
         // SAFETY: libfontconfig 已加载，`pattern` 是以 NUL 结尾的字符串；返回值判空后才使用。
         let raw = unsafe { (LIB.FcNameParse)(pattern.as_ptr() as *const u8) };
-        let raw = std::ptr::NonNull::new(raw)?;
-        // SAFETY: `raw` 是 `FcNameParse` 返回的有效模式。`from_pattern` 增加一次引用，随后释放
-        // `FcNameParse` 返回的那次引用，让返回的 `Pattern` 恰好拥有一次引用。
+        let raw = NonNull::new(raw)?;
+        // SAFETY: `FcNameParse` 返回新建的模式，调用方持有它的一次引用，之后不再使用 `raw`。
+        Some(unsafe { adopt(config, raw) })
+    }
+
+    /// 对 `pattern` 应用配置替换和默认替换，返回 fontconfig 的最佳匹配。
+    ///
+    /// 安全接口的 `Pattern::font_match` 为结果多加一次引用，结果因此无法释放，所以在这里调用
+    /// `FcFontMatch`。
+    pub(super) fn font_match<'a>(
+        config: &'a Fontconfig,
+        pattern: &mut Pattern<'_>,
+    ) -> Option<Pattern<'a>> {
+        if LIB_RESULT.is_err() {
+            return None;
+        }
+        pattern.config_substitute().ok()?;
+        pattern.default_substitute();
+        let mut result = sys::FcResultNoMatch;
+        // SAFETY: libfontconfig 已加载，`pattern` 是有效的模式；配置为空指针表示当前配置，
+        // `result` 是可写的局部变量。返回值判空后才使用。
+        let raw = unsafe { (LIB.FcFontMatch)(ptr::null_mut(), pattern.as_mut_ptr(), &mut result) };
+        let raw = NonNull::new(raw)?;
+        // SAFETY: `FcFontMatch` 返回新建的模式，调用方持有它的一次引用，之后不再使用 `raw`。
+        Some(unsafe { adopt(config, raw) })
+    }
+
+    /// 把 C 函数返回的新模式交给 [`Pattern`] 管理，返回的 `Pattern` 恰好持有一次引用。
+    ///
+    /// # Safety
+    ///
+    /// libfontconfig 已加载；`raw` 是有效的模式，调用方持有它的一次引用，调用后不再使用 `raw`。
+    unsafe fn adopt(config: &Fontconfig, raw: NonNull<sys::FcPattern>) -> Pattern<'_> {
+        // SAFETY: 调用方保证 `raw` 有效；`from_pattern` 为它增加一次引用。
         let pattern = unsafe { Pattern::from_pattern(config, raw.as_ptr()) };
-        // SAFETY: `raw` 仍是上面取得的有效模式；这次调用释放 `FcNameParse` 返回的引用，
-        // 之后只由 `pattern` 持有。
+        // SAFETY: `raw` 仍然有效；这次调用释放调用方转交的引用，之后只由 `pattern` 持有。
         unsafe { (LIB.FcPatternDestroy)(raw.as_ptr()) };
-        Some(pattern)
+        pattern
     }
 
     /// 返回模式指向的字体路径，保留非 UTF-8 字节；文件不存在时返回 `None`。
