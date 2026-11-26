@@ -117,14 +117,9 @@ mod fontconfig {
     use super::*;
     use crate::text::fontconfig::test_fonts::{self, Isolated};
 
-    /// 创建隔离环境；在父进程里它启动子进程并在子进程成功后返回 `None`，本测试随跳过。
-    fn isolated() -> Option<Isolated> {
-        Isolated::new()
-    }
-
     #[test]
     fn a_font_in_a_custom_directory_resolves() {
-        let Some(isolated) = isolated() else {
+        let Some(isolated) = Isolated::new() else {
             return;
         };
         let spec = FontSpec::Name(test_fonts::DEFAULT.into());
@@ -136,7 +131,7 @@ mod fontconfig {
 
     #[test]
     fn a_missing_name_is_not_replaced_by_a_substitute() {
-        let Some(_isolated) = isolated() else {
+        let Some(_isolated) = Isolated::new() else {
             return;
         };
         let spec = FontSpec::Name("Winc Missing 7f3a".into());
@@ -148,7 +143,7 @@ mod fontconfig {
 
     #[test]
     fn a_configured_alias_resolves_to_its_target() {
-        let Some(isolated) = isolated() else {
+        let Some(isolated) = Isolated::new() else {
             return;
         };
         // 别名指向的字体和未知名字的后备字体是同一个文件，仍要按别名找到它。
@@ -164,7 +159,7 @@ mod fontconfig {
 
     #[test]
     fn a_family_name_with_pattern_syntax_is_taken_literally() {
-        let Some(isolated) = isolated() else {
+        let Some(isolated) = Isolated::new() else {
             return;
         };
         for family in [test_fonts::LITERAL, test_fonts::OPTION] {
@@ -177,7 +172,7 @@ mod fontconfig {
 
     #[test]
     fn a_request_for_italic_does_not_invent_an_italic_face() {
-        let Some(isolated) = isolated() else {
+        let Some(isolated) = Isolated::new() else {
             return;
         };
         let found = crate::text::font_path::resolve_face(test_fonts::TARGET, false, true)
@@ -189,7 +184,7 @@ mod fontconfig {
 
     #[test]
     fn a_real_italic_face_is_reported_as_italic() {
-        let Some(isolated) = isolated() else {
+        let Some(isolated) = Isolated::new() else {
             return;
         };
         let found = crate::text::font_path::resolve_face(test_fonts::ITALIC, false, true)
@@ -207,7 +202,7 @@ mod fontconfig {
 
     #[test]
     fn the_style_flags_describe_the_face_that_was_found() {
-        let Some(isolated) = isolated() else {
+        let Some(isolated) = Isolated::new() else {
             return;
         };
         let found = crate::text::font_path::resolve_face(test_fonts::TARGET, true, false)

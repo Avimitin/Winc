@@ -1,14 +1,13 @@
 //! 按名字查字体文件：向各平台的字体系统查询，取回字体文件路径。
 //!
-//! macOS 用 CoreText 查询；Linux 用 fontconfig（记着发行版安装字体的位置和用户的别名，
-//! 也尊重配置排除的字体），fontconfig 不可用时扫描常见字体目录；Windows 在常见字体目录中
-//! 按文件名查找。`unsafe` 调用集中在 `macos` 模块和 fontconfig 封装，每处的 `// SAFETY:`
-//! 注释写明了所依赖的前提。
+//! macOS 用 CoreText 查询；Linux 用 fontconfig 查询，fontconfig 不可用时与 Windows 相同，在常见
+//! 字体目录中按文件名查找。`unsafe` 调用集中在 `macos` 模块和 `fontconfig` 模块，每处的
+//! `// SAFETY:` 注释写明了所依赖的前提。
 
 use std::path::PathBuf;
 
 use super::font_list::find_family;
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 use super::fontconfig;
 
 /// 一次字体请求：按名字查系统，或直接使用给定的路径。
@@ -16,9 +15,9 @@ use super::fontconfig;
 pub enum FontSpec {
     /// 字体名或字族名，例如 `Menlo`、`Helvetica`、`苹方-简`。
     ///
-    /// macOS 由 CoreText 查询，识别字族名、PostScript 名和本地化名称；Linux 由 fontconfig
-    /// 查询，识别字族名、通用字族名和用户配置的别名；Windows 按文件名前缀匹配，忽略空格、
-    /// 连字符、下划线和大小写，找不到时再按同样宽松的写法匹配已安装的字族名。
+    /// macOS 由 CoreText 查询，识别字族名、PostScript 名和本地化名称；Linux 由 fontconfig 查询，
+    /// 识别字族名、通用字族名和用户配置的别名。其他情况按文件名前缀匹配，忽略空格、连字符、
+    /// 下划线和大小写。这些方式都找不到时，再按同样宽松的写法匹配已安装的字族名。
     Name(String),
     /// 字体文件路径。
     Path(PathBuf),
@@ -40,9 +39,9 @@ pub(crate) struct FontFile {
     pub path: PathBuf,
     /// 字体的 PostScript 名；`.ttc` 集合中靠该名字确定是第几个字体。
     ///
-    /// 为 `None` 时看 `index`，两者都没有时取第一个。
+    /// 为 `None` 或文件中没有该名字时按 `index` 选，两者都没有结果时取第一个。
     pub postscript: Option<String>,
-    /// 字体在集合文件中的下标；fontconfig 用 `FC_INDEX` 指明集合中的第几个字体。
+    /// 字体在集合文件中的下标（从 0 起）；不是集合文件时为 `None`。
     pub index: Option<u32>,
 }
 
@@ -132,25 +131,16 @@ pub(crate) fn resolve_face(family: &str, bold: bool, italic: bool) -> Option<Fac
 
 /// 按字族名和粗体、斜体查找字体文件；字族不存在时返回 `None`。
 ///
-/// Linux 先按字族名向 fontconfig 查询（样式作为请求属性），取到的字体是否为粗体、斜体由
-/// 字体文件自身决定：字族里没有斜体时 fontconfig 给出正体，此时 `italic` 为假。fontconfig
-/// 可用时它就是已安装字体的唯一来源，查不到不再扫描固定目录；fontconfig 不可用时才按
-/// 「字族 Bold Italic」这样的文件名扫描常见字体目录。Windows 只做文件名扫描。
+/// fontconfig 可用时只向它查询（样式作为请求的属性）；不可用时先按「字族 Bold Italic」这样的
+/// 文件名查找，再查找字族本身。结果中的 `bold`、`italic` 是取到的字体自身的样式：字族中没有
+/// 斜体时取到正体，`italic` 为假。
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn resolve_face(family: &str, bold: bool, italic: bool) -> Option<FaceMatch> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(found) = fontconfig::lookup(family, bold, italic) {
-            let (bold, italic) = actual_style(&found.file);
-            return Some(FaceMatch {
-                file: found.file,
-                bold,
-                italic,
-            });
-        }
-        if fontconfig::available() {
-            return None;
-        }
+    if let Some(found) = fontconfig::lookup(family, bold, italic) {
+        return Some(FaceMatch::of(found.file));
+    }
+    if fontconfig::available() {
+        return None;
     }
     let styled = match (bold, italic) {
         (true, true) => Some(format!("{family} Bold Italic")),
@@ -158,47 +148,36 @@ pub(crate) fn resolve_face(family: &str, bold: bool, italic: bool) -> Option<Fac
         (false, true) => Some(format!("{family} Italic")),
         (false, false) => None,
     };
-    if let Some(file) = styled.and_then(|name| resolve_file_name(&name)) {
-        #[cfg(target_os = "linux")]
-        let (bold, italic) = actual_style(&file);
-        return Some(FaceMatch { file, bold, italic });
+    styled
+        .and_then(|name| resolve_file_name(&name))
+        .or_else(|| resolve_file_name(family))
+        .map(FaceMatch::of)
+}
+
+#[cfg(not(target_os = "macos"))]
+impl FaceMatch {
+    /// 创建字体文件 `file` 的匹配结果，样式取字体自身的样式；文件无法打开时按常规体。
+    fn of(file: FontFile) -> FaceMatch {
+        let (bold, italic) = super::font::actual_style(&file).unwrap_or_default();
+        FaceMatch { file, bold, italic }
     }
-    if let Some(file) = resolve_file_name(family) {
-        #[cfg(target_os = "linux")]
-        let (bold, italic) = actual_style(&file);
-        #[cfg(not(target_os = "linux"))]
-        let (bold, italic) = (false, false);
-        return Some(FaceMatch { file, bold, italic });
-    }
-    None
 }
 
 /// 返回字体名 `name` 对应的字体文件。
 ///
-/// Linux 先按字面名字交给 fontconfig：它认得装在固定目录之外的字体和用户配置的别名；对未知
-/// 名字只给出后备字体时不算找到，以免每个名字都解析成同一个字体、破坏字体的回退顺序。
-/// fontconfig 可用时只在它列出的字族里再按宽松写法找一次，不再扫描被配置排除的目录；
-/// fontconfig 不可用时才扫描常见目录。Windows 只做扫描。
+/// fontconfig 可用时先按字面名字查询，再在它列出的字族中按宽松的写法查找；fontconfig 为未知
+/// 名字给出的后备字体不算找到，否则字体列表中的每个名字都解析为同一个字体。fontconfig 不可用
+/// 时先按文件名、再按字族名在常见字体目录中查找。
 #[cfg(not(target_os = "macos"))]
 fn resolve_name(name: &str) -> Option<FontFile> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(found) = fontconfig::lookup(name, false, false) {
-            return Some(found.file);
-        }
-        if fontconfig::available() {
-            return find_family(name).map(|family| family.file.clone());
-        }
+    if let Some(found) = fontconfig::lookup(name, false, false) {
+        return Some(found.file);
     }
-    resolve_file_name(name).or_else(|| find_family(name).map(|family| family.file.clone()))
-}
-
-/// 返回字体文件 `file` 中字体的实际样式（粗体、斜体），与请求的样式无关。
-///
-/// 字体文件打不开时按常规体处理。
-#[cfg(target_os = "linux")]
-fn actual_style(file: &FontFile) -> (bool, bool) {
-    crate::text::font::actual_style(file).unwrap_or((false, false))
+    let family = || find_family(name).map(|family| family.file.clone());
+    if fontconfig::available() {
+        return family();
+    }
+    resolve_file_name(name).or_else(family)
 }
 
 /// 返回字体目录下的全部文件，每项是（规范化文件名，路径）。

@@ -3,11 +3,6 @@
 use super::test_fonts::{self, EmptyConfig, Isolated};
 use super::*;
 
-/// 创建隔离环境；在父进程里它启动子进程并在子进程成功后返回 `None`，本测试随跳过。
-fn isolated() -> Option<Isolated> {
-    Isolated::new()
-}
-
 /// 把字族名列表写成字符串，便于测试比较。
 fn names(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
@@ -15,7 +10,7 @@ fn names(names: &[&str]) -> Vec<String> {
 
 #[test]
 fn a_font_in_a_custom_directory_is_found() {
-    let Some(isolated) = isolated() else {
+    let Some(isolated) = Isolated::new() else {
         return;
     };
     let found = lookup(test_fonts::DEFAULT, false, false).expect("fontconfig 认得测试字体");
@@ -49,7 +44,7 @@ fn family_names_ignore_case_and_spaces_but_not_hyphens() {
 
 #[test]
 fn an_unknown_name_is_not_substituted() {
-    let Some(_isolated) = isolated() else {
+    let Some(_isolated) = Isolated::new() else {
         return;
     };
     // fontconfig 对任何名字都会给出一个字体；这不是该名字的字体，要按找不到处理。
@@ -63,7 +58,7 @@ fn an_unknown_name_is_not_substituted() {
 
 #[test]
 fn an_alias_configured_in_fontconfig_is_found() {
-    let Some(isolated) = isolated() else {
+    let Some(isolated) = Isolated::new() else {
         return;
     };
     assert_ne!(isolated.other_alias(), isolated.alias());
@@ -78,7 +73,7 @@ fn an_alias_configured_in_fontconfig_is_found() {
 /// 回归：别名指向的字体正好是未知名字的后备字体时，不能因为文件相同就按找不到处理。
 #[test]
 fn an_alias_to_the_fallback_face_is_found() {
-    let Some(isolated) = isolated() else {
+    let Some(isolated) = Isolated::new() else {
         return;
     };
     assert_eq!(
@@ -98,7 +93,7 @@ fn an_alias_to_the_fallback_face_is_found() {
 
 #[test]
 fn a_collection_face_keeps_its_index() {
-    let Some(isolated) = isolated() else {
+    let Some(isolated) = Isolated::new() else {
         return;
     };
     let found = lookup(test_fonts::COLLECTION, true, false).expect("集合里有粗体");
@@ -113,7 +108,7 @@ fn a_collection_face_keeps_its_index() {
 
 #[test]
 fn an_unknown_alias_target_is_not_a_font() {
-    let Some(_isolated) = isolated() else {
+    let Some(_isolated) = Isolated::new() else {
         return;
     };
     // 配置里有指向 Winc Uninstalled Target 的别名，但系统里没有这个字族；不能把 fontconfig
@@ -123,7 +118,7 @@ fn an_unknown_alias_target_is_not_a_font() {
 
 #[test]
 fn a_font_excluded_by_the_config_is_not_listed_or_found() {
-    let Some(isolated) = isolated() else {
+    let Some(isolated) = Isolated::new() else {
         return;
     };
     let excluded = isolated.excluded();
@@ -195,7 +190,7 @@ fn a_common_path_child() {
 
 #[test]
 fn a_family_name_is_taken_literally() {
-    let Some(isolated) = isolated() else {
+    let Some(isolated) = Isolated::new() else {
         return;
     };
     // 名字里有 fontconfig 模式的语法字符：`:`、`,`、`\`、`=` 和开头表示选项的 `-`。
@@ -207,7 +202,7 @@ fn a_family_name_is_taken_literally() {
 
 #[test]
 fn generic_family_names_are_found() {
-    let Some(_isolated) = isolated() else {
+    let Some(_isolated) = Isolated::new() else {
         return;
     };
     // 通用字族名不是任意替换，即使 fontconfig 给出的是参数相同的后备字体。
@@ -218,7 +213,7 @@ fn generic_family_names_are_found() {
 
 #[test]
 fn sorted_fonts_are_usable_font_files() {
-    let Some(_isolated) = isolated() else {
+    let Some(_isolated) = Isolated::new() else {
         return;
     };
     let fonts = sorted("sans-serif");
@@ -228,7 +223,7 @@ fn sorted_fonts_are_usable_font_files() {
 
 #[test]
 fn the_font_list_contains_the_custom_directory() {
-    let Some(isolated) = isolated() else {
+    let Some(isolated) = Isolated::new() else {
         return;
     };
     let files = files().expect("fontconfig 可用");

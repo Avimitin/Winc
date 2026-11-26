@@ -1,19 +1,14 @@
-//! 通过 libfontconfig 查询 Linux 上安装的字体：配置和字体列表、模式替换、匹配和排序，以及按
-//! 字面名字查字族。
+//! 通过 libfontconfig 查询 Linux 上安装的字体：最佳匹配、排序后的候选、字体列表和按字面字族名查找。
 //!
-//! Linux 上 fontconfig 是已安装字体的权威登记处：它记录了发行版安装字体的位置和用户配置的
-//! 目录，也应用用户的别名和替换设置。查询用 `fontconfig` crate 的安全接口，库在运行时加载，
-//! 不运行 `fc-*` 命令；库不可用时各函数返回空值，调用方退回按字体目录查找。测试以外的代码不
-//! 使用 `unsafe`，只有 [`raw`] 直接调用安全接口没有覆盖的函数。
-//!
-//! 安全的 `Pattern::filename` 只返回 UTF-8 名字，`Pattern::get_string` 只读第一个值；本模块要
-//! 保留字体路径的原始字节，也要看完整的字族列表来判断别名是否指向已安装的字体，因此在
-//! [`raw`] 中补上这两项。模式写法（如 `monospace:lang=zh-cn`）由 `FcNameParse` 解析，安全接口
-//! 没有这一项。
+//! fontconfig 记录发行版安装字体的位置和用户配置的目录，并应用用户的别名与替换规则。库在运行时
+//! 加载，不运行 `fc-*` 命令；库无法加载时各函数返回空值，调用方改为扫描常见字体目录。查询使用
+//! `fontconfig` crate 的安全接口；模式解析、保留原始字节的路径和多值字段的读取不在安全接口中，
+//! 由 [`raw`] 直接调用 C 函数。
 
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use ::fontconfig::{
     FC_FAMILY, FC_SLANT, FC_SLANT_ITALIC, FC_WEIGHT, FC_WEIGHT_BOLD, Fontconfig, Pattern,
@@ -26,12 +21,20 @@ use super::font_path::FontFile;
 pub(super) struct Match {
     /// 字体文件。
     pub(super) file: FontFile,
-    /// 结果字体的字族名，用于判断查询是否真的命中；为空时按未命中处理。
+    /// 结果字体的全部字族名，用于判断查询的名字是否命中。
     families: Vec<String>,
 }
 
-/// 选后备字体时最多尝试的 fontconfig 结果数（经验值）：系统里没有合适的字体时不逐个打开全部字体。
+/// 选后备字体时最多尝试的 fontconfig 结果数（个）。
+///
+/// 取自调参：系统里没有合适的字体时不逐个打开全部字体。
 const SORTED_FONTS: usize = 64;
+
+/// 等待 [`sorted`] 查询结果的最长时间（2 秒）。
+///
+/// 查询在第一次绘制某种文字时进行，其间界面不响应。字体缓存已建好时查询远快于该时间；超时
+/// （缓存正在重建）按没有结果处理，改用固定的候选字体。
+const SORT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 必然不存在的字族名。fontconfig 对任何名字都做配置替换；用它作对照，可以区分名字命中的
 /// 别名或替换规则和对任何名字都做的通用替换。
@@ -71,16 +74,15 @@ pub(super) fn best(pattern: &str) -> Option<Match> {
 }
 
 /// 返回 fontconfig 为 `pattern` 排序的字体，最匹配的在前，最多 [`SORTED_FONTS`] 个。
+///
+/// 查询在另一个线程中进行，最多等待 [`SORT_TIMEOUT`]，超时返回空列表。
 pub(super) fn sorted(pattern: &str) -> Vec<FontFile> {
-    // 首次绘制时，字体缓存可能正在重建。沿用两秒等待上限，不在界面线程等待查询完成。
     let pattern = pattern.to_owned();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = sender.send(sorted_files(&pattern));
     });
-    receiver
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap_or_default()
+    receiver.recv_timeout(SORT_TIMEOUT).unwrap_or_default()
 }
 
 fn sorted_files(pattern: &str) -> Vec<FontFile> {
@@ -99,14 +101,10 @@ fn sorted_files(pattern: &str) -> Vec<FontFile> {
         .collect()
 }
 
-/// 返回 fontconfig 列出的全部字体文件，已排序、去重；fontconfig 不可用时返回 `None`。
+/// 返回 fontconfig 列出的全部字体文件，已排序、去重；fontconfig 不可用或无法列出时返回 `None`。
 pub(super) fn files() -> Option<Vec<PathBuf>> {
-    let Some(pattern) = Pattern::new(current()?).ok() else {
-        return Some(Vec::new());
-    };
-    let Ok(set) = list_fonts(&pattern, None) else {
-        return Some(Vec::new());
-    };
+    let pattern = Pattern::new(current()?).ok()?;
+    let set = list_fonts(&pattern, None).ok()?;
     // 空集合的 `FcFontSet.fonts` 为空指针；`FontSet::iter` 在 `nfont == 0` 时返回空迭代器，
     // 不会构造空指针切片。
     let mut paths: Vec<PathBuf> = set.iter().filter_map(|font| raw::path(&font)).collect();
@@ -237,10 +235,10 @@ fn families_added(requested: &[String], probe: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 安全接口没有覆盖、或只给出 UTF-8 名字的 fontconfig 调用。
+/// 安全接口不提供，或只返回 UTF-8 字符串的 fontconfig 调用。
 ///
-/// 这些都是只读查询，除了 `FcNameParse` 返回的新模式之外不转移所有权；每个 `unsafe` 块都写明
-/// 了前提。
+/// 除 `FcNameParse` 返回的新模式外都是只读查询，不转移所有权。
+// 本模块的 `unsafe` 仅用于调用 libfontconfig 的 C 函数，不扩散到其他模块。
 #[allow(unsafe_code)]
 mod raw {
     use std::ffi::{CStr, CString, c_char, c_int};
@@ -292,6 +290,8 @@ mod raw {
     }
 
     /// 返回模式指向的字体；只有集合文件保留下标。
+    ///
+    /// `FC_INDEX` 的低 16 位是字体在集合中的下标，高位是可变字体的命名实例。
     pub(super) fn file(pattern: &Pattern<'_>) -> Option<FontFile> {
         let path = path(pattern)?;
         let postscript = pattern
@@ -306,7 +306,7 @@ mod raw {
         let index = pattern
             .face_index()
             .ok()
-            .and_then(|index| u32::try_from(index).ok());
+            .and_then(|index| u32::try_from(index & 0xFFFF).ok());
         Some(FontFile {
             path,
             postscript,

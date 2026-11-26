@@ -1,7 +1,7 @@
 //! 已安装的字体：设置中的字体菜单从这里取字族，按名字找不到字体时也在这里按宽松的写法再找一次。
 //!
-//! macOS 向 CoreText 查询字族；Linux 读取 fontconfig 列出的字体文件，Windows 读取字体目录下
-//! 每个字体文件的名字表。
+//! macOS 向 CoreText 查询字族；其他平台读取字体文件的名字表，Linux 上字体文件由 fontconfig
+//! 列出。
 
 use std::sync::OnceLock;
 
@@ -26,11 +26,7 @@ pub struct FontFamily {
 /// 返回已安装的字族，按名字排序（不区分大小写）。
 ///
 /// 第一次调用时读取字体文件，字体多时耗时明显，应先在后台线程调用一次；之后直接返回结果。程序
-/// 运行期间新安装的字体需要重启后才能列出。
-///
-/// Linux 上 fontconfig 可用时字族来自它列出的字体文件，因此包括装在固定目录之外的字体，
-/// 也尊重用户配置里排除的目录；fontconfig 不可用时扫描常见字体目录。Windows 只扫描系统字体
-/// 目录和当前用户的字体目录。
+/// 运行期间新安装的字体需要重启后才能列出。Linux 上 fontconfig 可用时只列出它登记的字体。
 pub fn installed_fonts() -> &'static [FontFamily] {
     static FONTS: OnceLock<Vec<FontFamily>> = OnceLock::new();
     FONTS.get_or_init(|| sorted(list()))
@@ -57,7 +53,7 @@ fn sorted(mut families: Vec<FontFamily>) -> Vec<FontFamily> {
 /// 返回 CoreText 列出的字族，以及它不列出但可以按名字使用的系统字体；以 `.` 开头的名字是系统保留
 /// 的，不列出。
 #[cfg(target_os = "macos")]
-pub(super) fn list() -> Vec<FontFamily> {
+fn list() -> Vec<FontFamily> {
     use super::font_path::{exact_font, macos_families};
 
     macos_families()
@@ -88,19 +84,14 @@ fn file_is_monospace(file: &FontFile) -> bool {
 
 /// 返回已安装字体文件中的字族。
 ///
-/// Linux 上 fontconfig 可用时只读它列出的字体：它是已安装字体的唯一来源，也尊重用户配置里
-/// 排除的目录。fontconfig 不可用时扫描常见字体目录。Windows 只读固定目录。
+/// fontconfig 可用时只读取它列出的字体文件，包括固定目录之外的字体，不包括配置中排除的字体；
+/// 不可用时读取常见字体目录中的文件。
 #[cfg(not(target_os = "macos"))]
 pub(super) fn list() -> Vec<FontFamily> {
-    #[cfg(target_os = "linux")]
-    if let Some(paths) = super::fontconfig::files() {
-        return scan(paths.iter());
+    match super::fontconfig::files() {
+        Some(paths) => scan(paths.iter()),
+        None => scan(super::font_path::font_index().iter().map(|(_, path)| path)),
     }
-    let paths: Vec<std::path::PathBuf> = super::font_path::font_index()
-        .iter()
-        .map(|(_, path)| path.clone())
-        .collect();
-    scan(paths.iter())
 }
 
 /// 读取 `paths` 中各字体文件的名字表，返回其中的字族；字族中有多个字体时取最接近常规体的一个。
