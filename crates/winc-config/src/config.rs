@@ -3,6 +3,7 @@
 //! 每一项设置的键名和读写规则由 `fields` 模块给出。
 
 mod fields;
+mod transfer;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use crate::files::{config_dir, write_atomic};
 use crate::json::{self, Json};
 use fields::*;
 use winc_i18n::{LocaleChoice, t};
+
+pub use transfer::{Imported, export_config, import_config};
 
 /// 用户配置。
 ///
@@ -64,6 +67,9 @@ pub struct Config {
     pub hot_exit: Option<bool>,
     /// 关闭窗口或退出前是否先确认，默认为否。
     pub confirm_close: Option<bool>,
+    /// macOS 上关闭最后一个窗口时是否退出应用，默认为否（应用留在程序坞中）；其他平台上关闭
+    /// 最后一个窗口总是退出。
+    pub quit_on_last_window_close: Option<bool>,
     /// 启动时打开上次退出时打开的目录和标签，默认为开。
     ///
     /// 关闭后每次启动都显示开始页；命令行指定了目录或文件时仍然打开。
@@ -74,6 +80,8 @@ pub struct Config {
     pub default_language: Option<String>,
     /// 向空的未命名纯文本文档粘贴时是否按内容识别语言，默认为是。
     pub detect_language_on_paste: Option<bool>,
+    /// 是否可以拖动选中的文字来移动或复制（`editor.dragAndDrop`），默认为是。
+    pub drag_and_drop: Option<bool>,
     /// 把目录拖进已打开目录的窗口时怎样处理，默认每次询问。
     pub drop_folder: Option<FolderDrop>,
     /// 「在文件中查找」打开在哪里；没写时按键位方案：`idea` 为对话框，否则为侧栏。
@@ -87,6 +95,8 @@ pub struct Config {
     pub sticky_scroll: Option<bool>,
     /// 自动换行：按编辑区宽度把长行断开显示（不修改文件），默认为否。
     pub word_wrap: Option<bool>,
+    /// CSV、TSV 按列对齐显示（不修改文件），默认为开；关闭时按原文排布，仍按列着色。
+    pub align_columns: Option<bool>,
     /// 超长行显示全部内容，而不是只显示开头的一部分，默认为否。
     pub whole_lines: Option<bool>,
     /// 在编辑区右侧显示缩略图，默认为否。
@@ -101,10 +111,15 @@ pub struct Config {
     pub render_whitespace: Option<RenderWhitespace>,
     /// 差异单栏显示：新旧内容上下排列，默认为否（左右并排）。
     pub diff_inline: Option<bool>,
+    /// 差异中较长的未更改内容折叠为一行，默认为是；关闭后差异打开时就是全部展开的。
+    pub diff_collapse_unchanged: Option<bool>,
     /// 在行号栏显示行号，默认为是；关闭后折叠箭头、书签和改动标记仍然显示。
     pub line_numbers: Option<bool>,
     /// 显示窗口底部的状态栏，默认为是。
     pub status_bar: Option<bool>,
+    /// 编辑器的标签按文件名加宽、显示完整的文件名，默认为是；关闭后标签有最大宽度，过长的文件名
+    /// 截短。
+    pub full_tab_names: Option<bool>,
     /// 新窗口沿用上次关闭时的大小和位置，默认为是。
     pub restore_window: Option<bool>,
     /// 配色：`auto` 跟随系统，`dark` 或 `light` 强制指定。
@@ -158,6 +173,8 @@ pub struct Config {
     pub compact_folders: Option<bool>,
     /// 在文件树中单击文件时是否在预览标签中打开；未设置时为否。
     pub preview_on_click: Option<bool>,
+    /// 切换、打开文件时是否在文件树中展开并选中该文件；未设置时为是。
+    pub tree_auto_reveal: Option<bool>,
     /// 「在外部终端中打开」使用的终端程序；未设置时使用系统默认的终端程序。
     pub external_terminal: Option<String>,
     /// 是否开启 Vim 模式，默认为否。
@@ -258,12 +275,17 @@ pub struct Config {
     pub system_proxy: Option<bool>,
     /// 是否在光标所在行的末尾淡淡地显示最后修改这一行的作者、时间和提交说明，默认为是。
     pub git_inline_blame: Option<bool>,
+    /// 是否在提交视图的更改下方列出最近的提交和提交图，默认为否。
+    pub git_commit_history: Option<bool>,
     /// 是否定时在后台获取远程仓库的更新，默认为否：获取会连接远程，需要认证的远程可能每次都
     /// 要求操作。
     pub git_auto_fetch: Option<bool>,
     /// 提交视图是否使用暂存区视图（按暂存区分组，提交暂存区的内容），默认为否，用勾选决定提交的
     /// 内容。
     pub git_staging_area: Option<bool>,
+    /// 点击提交视图中的文件时，是否在「未提交的更改」标签中连续显示所有更改并定位到该文件，默认
+    /// 为否，打开这个文件的差异。
+    pub git_combined_diff: Option<bool>,
     /// 在打开的目录下查找仓库的层数，默认见 [`Config::REPOSITORY_SCAN_DEPTH`]，可用范围见
     /// [`Config::REPOSITORY_SCAN_DEPTH_RANGE`]。
     pub repository_scan_depth: Option<usize>,
@@ -279,6 +301,8 @@ pub struct Config {
     pub git_open_worktree: Option<WorktreeOpen>,
     /// 拉取、同步时怎样并入上游的提交，默认按 Git 的配置。
     pub git_pull: Option<PullMode>,
+    /// 日志和文件历史显示在哪里，默认在窗口底部的 Git 面板中。
+    pub git_log_placement: Option<LogPlacement>,
     /// 新建工作树时复制过去的被忽略的文件（gitignore 写法的 glob，如 `.env*`），默认不复制。
     pub git_worktree_copy: Vec<String>,
     /// 保存时先格式化，默认为否。
@@ -419,6 +443,21 @@ impl PullMode {
             Self::Rebase => Some(true),
         }
     }
+}
+
+/// 日志和文件历史显示在哪里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogPlacement {
+    /// 窗口底部、侧栏和编辑区下方的 Git 面板。
+    #[default]
+    Panel,
+    /// 编辑区的标签。
+    Editor,
+}
+
+impl LogPlacement {
+    /// 全部取值，按设置菜单中的顺序排列。
+    pub const ALL: [Self; 2] = [Self::Panel, Self::Editor];
 }
 
 /// 点击工作树时在哪个窗口打开它。

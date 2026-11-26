@@ -72,7 +72,8 @@ pub(crate) struct Laid {
     /// 比正文宽的表格的横向滚动位置（逻辑像素）：键为（顶层块序号，块中表格的序号，见
     /// [`LaidBlock::scrolls`]）。重排后按序号沿用。
     pub(crate) hscroll: HashMap<(usize, usize), f32>,
-    /// 上一次横向滚动使其可见的光标位置（原文字节偏移），见 [`Laid::follow_caret`]。
+    /// 上一次横向滚动使其可见的光标位置（原文字节偏移），见 [`Laid::follow_caret`]。文字和
+    /// 光标都未变时重排后沿用。
     pub(crate) followed: Option<usize>,
     /// 各顶层块是否仍沿用旧条件下的排版结果（见 [`Later`]）；全部按当前条件排好时为空。
     pub(crate) stale: Vec<bool>,
@@ -154,6 +155,10 @@ pub(crate) struct Key {
     pub(crate) numbers: bool,
     /// mermaid 图的高度上限（逻辑像素，见 `Cx::tall`）。
     pub(crate) tall: f32,
+    /// 比正文宽的表格可以占用的两侧留白（逻辑像素，见 `Cx::bleed`）。
+    ///
+    /// 只决定表格的位置，不影响排版缓存（列宽、折行不变）。
+    pub(crate) bleed: (f32, f32),
 }
 
 /// 重排之前各顶层块的排版和绘制位置，重排后据此计算过渡动画（见 `BlockMotion`）。
@@ -477,6 +482,7 @@ pub(crate) fn lay_out(
         tall: key.tall,
         repeat: 0,
         toggles: HashMap::new(),
+        bleed: key.bleed,
     };
     let env = Env {
         color: cx.colors.text,
@@ -799,6 +805,31 @@ impl Laid {
         self.caret.set(None);
     }
 
+    /// 内容坐标 `(x, y)`（相对内容左上角）是否落在表格上；可横向滚动的表格只算显示区域。
+    pub(crate) fn table_at(&self, x: f32, y: f32) -> bool {
+        self.table_span(y)
+            .is_some_and(|(left, right)| (left..=right).contains(&x))
+    }
+
+    /// 内容纵坐标 `y`（相对内容顶部）所在行的表格的左右边缘（相对内容左边）；可横向滚动的表格
+    /// 取显示区域。该行没有表格时返回 `None`。
+    pub(crate) fn table_span(&self, y: f32) -> Option<(f32, f32)> {
+        let i = self.tops.partition_point(|&t| t <= y).checked_sub(1)?;
+        let (_, block) = self.blocks.get(i)?;
+        let y = y - self.tops[i];
+        (block.items.iter().enumerate()).find_map(|(k, item)| {
+            let Item::Table { rect, .. } = item else {
+                return None;
+            };
+            let shown = block
+                .scroller_of(k)
+                .map_or(*rect, |s| block.scrolls[s].rect);
+            (shown.y..shown.bottom())
+                .contains(&y)
+                .then_some((shown.x, shown.right()))
+        })
+    }
+
     /// 内容坐标 `(x, y)`（相对内容左上角）处可横向滚动的表格：（块序号，表格序号，最大滚动距离）。
     pub(crate) fn scroller_at(&self, x: f32, y: f32) -> Option<(usize, usize, f32)> {
         let i = self.tops.partition_point(|&t| t <= y).checked_sub(1)?;
@@ -918,14 +949,17 @@ pub(crate) fn offset_at(app: &App, x: f32, y: f32) -> Option<usize> {
     hit(app, x, y).map(|hit| hit.offset)
 }
 
-/// 窗口横坐标 `x` 是否落在预览的内容一栏内（左右各放宽 [`CONTENT_SLACK`]）。
+/// 窗口坐标 `(x, y)` 是否落在预览的内容一栏内（左右各放宽 [`CONTENT_SLACK`]），或落在超出
+/// 一栏、占用两侧留白的表格上。
 ///
 /// 内容一栏两侧的空白不对应任何文字：在那里按下鼠标不放光标、不开始选字。
-pub(crate) fn in_content(app: &App, x: f32) -> bool {
+pub(crate) fn in_content(app: &App, x: f32, y: f32) -> bool {
+    let (area, scroll) = (app.preview.markdown.area, app.preview.markdown.scroll());
     app.preview.markdown.layout.as_ref().is_none_or(|laid| {
         let left = laid.left - CONTENT_SLACK;
         let right = laid.left + laid.key.width + CONTENT_SLACK;
-        (left..=right).contains(&x)
+        let (cx, cy) = (x - laid.left, y - (area.y + laid.pad - scroll));
+        (left..=right).contains(&x) || laid.table_at(cx, cy)
     })
 }
 

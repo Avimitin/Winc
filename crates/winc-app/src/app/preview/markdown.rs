@@ -669,6 +669,7 @@ impl App {
             _ => None,
         };
         let latex = doc.preview_kind() == Some(PreviewKind::Latex);
+        let edited = reading.is_none();
         md.pending = Some(revision);
         let (sender, proxy) = (md.sender.clone(), self.link.proxy.clone());
         winc_editor::background::spawn(move || {
@@ -677,6 +678,9 @@ impl App {
             let (parsed, lines) = if latex {
                 let converted = winc_preview::latex::to_markdown(&text);
                 (markdown::parse(&converted.markdown), Some(converted.map))
+            } else if edited {
+                // 块之间多出的空行显示为空段落，与可编辑的预览在界面线程上的解析一致。
+                (markdown::parse(&text).with_blank_lines(&text), None)
             } else {
                 (markdown::parse(&text), None)
             };
@@ -712,7 +716,8 @@ impl App {
             return false;
         };
         let started = std::time::Instant::now();
-        let parsed = markdown::parse(&rope.to_string());
+        let text = rope.to_string();
+        let parsed = markdown::parse(&text).with_blank_lines(&text);
         md.cost = Some(started.elapsed());
         md.pending = None;
         md.checked = Some(revision);
@@ -987,7 +992,7 @@ impl App {
     pub(in crate::app) fn click_markdown(&mut self, x: f32, y: f32) {
         self.focus = crate::app::Focus::Editor;
         // 内容一栏两侧的空白：分栏时将键盘焦点交给预览，但不放置光标、不开始选择，保留已有选区。
-        if !crate::app::preview::markdown::laid::in_content(self, x) {
+        if !crate::app::preview::markdown::laid::in_content(self, x, y) {
             if !self.markdown_live() {
                 self.preview.markdown.focused = true;
                 self.request_redraw();

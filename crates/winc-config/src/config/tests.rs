@@ -336,20 +336,25 @@ fn round_trips_through_json() {
         auto_save: Some(AutoSave::AfterDelay),
         hot_exit: Some(false),
         confirm_close: Some(true),
+        quit_on_last_window_close: Some(true),
         restore_folder: Some(false),
         new_file_on_startup: Some(true),
         default_language: Some("markdown".to_string()),
         detect_language_on_paste: Some(false),
+        drag_and_drop: Some(false),
         open_folder_in_new_window: Some(true),
         sticky_scroll: Some(false),
         word_wrap: Some(true),
+        align_columns: Some(false),
         whole_lines: Some(true),
         minimap: Some(true),
         outline: Some(false),
         render_whitespace: Some(RenderWhitespace::Trailing),
         diff_inline: Some(true),
+        diff_collapse_unchanged: Some(false),
         line_numbers: Some(false),
         status_bar: Some(false),
+        full_tab_names: Some(false),
         restore_window: Some(false),
         theme: Some(ThemeChoice::Dark),
         light_theme: Some("paper".to_string()),
@@ -371,6 +376,7 @@ fn round_trips_through_json() {
         confirm_drag_and_drop: Some(false),
         compact_folders: Some(false),
         preview_on_click: Some(true),
+        tree_auto_reveal: Some(false),
         external_terminal: Some("test-terminal".to_string()),
         vim_enabled: Some(true),
         vim_clipboard: Some(VimClipboard::Always),
@@ -410,12 +416,15 @@ fn round_trips_through_json() {
         git_remember_credentials: Some(false),
         system_proxy: Some(false),
         git_inline_blame: Some(false),
+        git_commit_history: Some(true),
         git_auto_fetch: Some(true),
         git_staging_area: Some(true),
+        git_combined_diff: Some(true),
         repository_scan_depth: Some(4),
         git_worktree_root: Some("~/worktrees".to_string()),
         git_open_worktree: Some(WorktreeOpen::NewWindow),
         git_pull: Some(PullMode::Rebase),
+        git_log_placement: Some(LogPlacement::Editor),
         git_path: Some("C:\\Tools\\wslgit.exe".to_string()),
         remote_enabled: Some(true),
         remote_local_folders: BTreeMap::from([
@@ -843,6 +852,22 @@ fn pull_reads_its_three_values_and_rejects_others() {
     }
     let (config, problems) = Config::parse(r#"{ "git": { "pull": "ff" } }"#);
     assert_eq!(config.git_pull, None);
+    assert_eq!(problems.len(), 1);
+}
+
+#[test]
+fn log_placement_reads_panel_or_editor_and_rejects_others() {
+    for (text, expected) in [
+        ("panel", LogPlacement::Panel),
+        ("editor", LogPlacement::Editor),
+    ] {
+        let json = format!(r#"{{ "git": {{ "logPlacement": "{text}" }} }}"#);
+        let (config, problems) = Config::parse(&json);
+        assert_eq!(config.git_log_placement, Some(expected));
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+    let (config, problems) = Config::parse(r#"{ "git": { "logPlacement": "tab" } }"#);
+    assert_eq!(config.git_log_placement, None);
     assert_eq!(problems.len(), 1);
 }
 

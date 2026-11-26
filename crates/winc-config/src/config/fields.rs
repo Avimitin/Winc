@@ -169,6 +169,7 @@ const EDITOR: &[Field] = &[
     },
     bool_field!("hotExit", hot_exit),
     bool_field!("confirmClose", confirm_close),
+    bool_field!("quitOnLastWindowClose", quit_on_last_window_close),
     bool_field!("restoreFolder", restore_folder),
     bool_field!("newFileOnStartup", new_file_on_startup),
     string_field!("defaultLanguage", default_language),
@@ -217,7 +218,9 @@ const EDITOR: &[Field] = &[
         },
     },
     bool_field!("stickyScroll", sticky_scroll),
+    bool_field!("dragAndDrop", drag_and_drop),
     bool_field!("wordWrap", word_wrap),
+    bool_field!("alignColumns", align_columns),
     bool_field!("wholeLines", whole_lines),
     bool_field!("minimap", minimap),
     bool_field!("smoothScrolling", smooth_scrolling),
@@ -261,8 +264,10 @@ const EDITOR: &[Field] = &[
         },
     },
     bool_field!("diffInline", diff_inline),
+    bool_field!("diffCollapseUnchanged", diff_collapse_unchanged),
     bool_field!("lineNumbers", line_numbers),
     bool_field!("statusBar", status_bar),
+    bool_field!("fullTabNames", full_tab_names),
     bool_field!("restoreWindow", restore_window),
 ];
 
@@ -344,6 +349,7 @@ const TREE: &[Field] = &[
     bool_field!("confirmDragAndDrop", confirm_drag_and_drop),
     bool_field!("compactFolders", compact_folders),
     bool_field!("previewOnClick", preview_on_click),
+    bool_field!("autoReveal", tree_auto_reveal),
 ];
 
 /// `markdown` 一节。
@@ -679,8 +685,10 @@ const GIT: &[Field] = &[
     bool_field!("confirmPush", git_confirm_push),
     bool_field!("rememberCredentials", git_remember_credentials),
     bool_field!("inlineBlame", git_inline_blame),
+    bool_field!("commitHistory", git_commit_history),
     bool_field!("autoFetch", git_auto_fetch),
     bool_field!("stagingArea", git_staging_area),
+    bool_field!("combinedDiff", git_combined_diff),
     Field {
         key: "repositoryScanDepth",
         read: |config, value, name, problems| {
@@ -745,6 +753,26 @@ const GIT: &[Field] = &[
                 PullMode::Config => "config",
                 PullMode::Merge => "merge",
                 PullMode::Rebase => "rebase",
+            };
+            Some(Json::String(value.into()))
+        },
+    },
+    Field {
+        key: "logPlacement",
+        read: |config, value, name, problems| {
+            config.git_log_placement = match value.as_str() {
+                Some("panel") => Some(LogPlacement::Panel),
+                Some("editor") => Some(LogPlacement::Editor),
+                _ => {
+                    problems.push(t!("config-log-placement-invalid", name = name));
+                    None
+                }
+            };
+        },
+        write: |config| {
+            let value = match config.git_log_placement? {
+                LogPlacement::Panel => "panel",
+                LogPlacement::Editor => "editor",
             };
             Some(Json::String(value.into()))
         },

@@ -127,6 +127,8 @@ pub enum MenuCommand {
     FindInFolder,
     CopyPath,
     CopyRelativePath,
+    /// 将文件树中选中的文件复制为 Markdown 提示词。
+    CopyAsPrompt,
     /// 编辑区：复制 `路径:行`。
     CopyReference,
     Rename,
@@ -213,6 +215,8 @@ pub enum MenuCommand {
     LocationRemove,
     /// 位置选择器的操作菜单：清理目录已不存在的工作树。
     LocationPrune,
+    /// 位置选择器的操作菜单：把仓库从列表中移除（不删除文件），再次手动添加前不再列出。
+    LocationForget,
     Cut,
     Copy,
     Paste,
@@ -231,6 +235,12 @@ pub enum MenuCommand {
     Format,
     FormatSelection,
     Fix,
+    /// 编辑区菜单「比较」中的一项：把整篇文档与剪贴板中的文字比较。
+    CompareWithClipboard,
+    /// 同 [`MenuCommand::CompareWithClipboard`]，有选区时比较选中部分。
+    CompareSelectionWithClipboard,
+    /// 编辑区菜单「比较」中的一项：把文档与磁盘上已保存的版本比较。
+    CompareWithSaved,
     /// 设置中「添加语言…」菜单的一项，参数为语言在 `winc_syntax::languages()` 中的序号（从 0 起）。
     Language(usize),
     /// 设置中「排除的语言」菜单的一项：切换某种语言保存时是否跳过格式化和修复，
@@ -247,12 +257,16 @@ pub enum MenuCommand {
     /// 设置中「Vim 剪贴板」菜单的一项，参数为
     /// [`VimClipboard::ALL`](winc_config::VimClipboard::ALL) 中的序号（从 0 起）。
     VimClipboard(usize),
+    /// 设置中「快捷键冲突」一行的菜单项：交给 Vim（`true`）或编辑器。
+    VimKeyOwner(bool),
     /// 设置中「打开工作树」菜单的一项，参数为
     /// [`WorktreeOpen::ALL`](winc_config::WorktreeOpen::ALL) 中的序号（从 0 起）。
     OpenWorktree(usize),
     /// 设置中「拉取方式」菜单的一项，参数为 [`PullMode::ALL`](winc_config::PullMode::ALL) 中的
     /// 序号（从 0 起）。
     PullMode(usize),
+    /// 设置页「日志位置」菜单中的第几项（`winc_config::LogPlacement::ALL` 的下标）。
+    LogPlacement(usize),
     /// 设置中「拖入目录」菜单的一项，参数为
     /// [`FolderDrop::ALL`](winc_config::FolderDrop::ALL) 中的序号（从 0 起）。
     DropFolder(usize),
@@ -447,6 +461,8 @@ pub enum MenuCommand {
     LogGoTo,
     /// 日志里的提交：与输入的提交号、分支或标签比较。
     LogCompareRevision,
+    /// 提交历史里的提交：在日志中选中它。
+    LogShowInLog,
     /// 编辑区：开关逐行追溯（开着时打勾）。
     ToggleBlame,
     /// 提交视图「⋯」：储藏改动（输入说明）。
@@ -524,6 +540,14 @@ pub enum MenuCommand {
     NewTerminal,
     /// 终端：拆分标签，新终端在当前终端的目录里启动。
     SplitTerminal,
+    /// 终端：向右分栏（面板在下方时）。
+    MoveTerminalRight,
+    /// 终端：向下分栏（面板在右侧时）。
+    MoveTerminalDown,
+    /// 把终端标签移到编辑区。
+    MoveTerminalToEditor,
+    /// 把编辑区里的终端标签移回终端面板。
+    MoveTerminalToPanel,
     /// 终端标签：改名字。
     RenameTerminal,
     CloseTerminal,
@@ -585,6 +609,7 @@ impl MenuCommand {
             MenuCommand::FindInFolder => t!("cmd-find-in-folder"),
             MenuCommand::CopyPath => t!("cmd-copy-path"),
             MenuCommand::CopyRelativePath => t!("cmd-copy-relative-path"),
+            MenuCommand::CopyAsPrompt => t!("menu-copy-as-prompt"),
             MenuCommand::CopyReference => t!("cmd-copy-reference"),
             MenuCommand::Rename => t!("cmd-rename-file"),
             MenuCommand::Delete => t!("cmd-delete-file"),
@@ -643,6 +668,7 @@ impl MenuCommand {
             // 文字来自当时的分支和位置（`App::menu_label`）。
             MenuCommand::StatusPlace(_) => "",
             MenuCommand::LocationPrune => t!("git-location-prune"),
+            MenuCommand::LocationForget => t!("git-location-forget"),
             MenuCommand::GitFetch => t!("menu-git-fetch"),
             MenuCommand::GitPull => t!("menu-git-pull"),
             MenuCommand::GitPush => t!("menu-git-push"),
@@ -685,6 +711,7 @@ impl MenuCommand {
             MenuCommand::LogCopyShortOid => t!("menu-log-copy-short-oid"),
             MenuCommand::LogGoTo => t!("menu-log-go-to"),
             MenuCommand::LogCompareRevision => t!("menu-log-compare-revision"),
+            MenuCommand::LogShowInLog => t!("menu-log-show-in-log"),
             MenuCommand::LogCopyMessage => t!("menu-log-copy-message"),
             MenuCommand::LogCopyPatch => t!("menu-log-copy-patch"),
             MenuCommand::LogCompareWithLocal => t!("menu-log-compare-with-local"),
@@ -728,6 +755,10 @@ impl MenuCommand {
             MenuCommand::TerminalMaximize => t!("menu-terminal-maximize"),
             MenuCommand::NewTerminal => t!("cmd-new-terminal"),
             MenuCommand::SplitTerminal => t!("cmd-split-terminal"),
+            MenuCommand::MoveTerminalRight => t!("menu-terminal-move-right"),
+            MenuCommand::MoveTerminalDown => t!("menu-terminal-move-down"),
+            MenuCommand::MoveTerminalToEditor => t!("terminal-move-to-editor"),
+            MenuCommand::MoveTerminalToPanel => t!("terminal-move-to-panel"),
             MenuCommand::RenameTerminal => t!("cmd-rename-file"),
             MenuCommand::CloseTerminal => t!("menu-terminal-close"),
             MenuCommand::CloseOtherTerminals => t!("cmd-close-other-tabs"),
@@ -773,12 +804,16 @@ impl MenuCommand {
             MenuCommand::VimClipboard(i) => winc_config::VimClipboard::ALL
                 .get(i)
                 .map_or("", |&choice| crate::layout::vim_clipboard_label(choice)),
+            MenuCommand::VimKeyOwner(vim) => crate::layout::vim_key_owner_label(vim),
             MenuCommand::OpenWorktree(i) => winc_config::WorktreeOpen::ALL
                 .get(i)
                 .map_or("", |&choice| crate::layout::open_worktree_label(choice)),
             MenuCommand::PullMode(i) => winc_config::PullMode::ALL
                 .get(i)
                 .map_or("", |&choice| crate::layout::pull_mode_label(choice)),
+            MenuCommand::LogPlacement(i) => winc_config::LogPlacement::ALL
+                .get(i)
+                .map_or("", |&choice| crate::layout::log_placement_label(choice)),
             MenuCommand::SearchStyle(i) => winc_config::SearchStyle::ALL
                 .get(i)
                 .map_or("", |&choice| crate::layout::search_style_label(choice)),
@@ -841,6 +876,11 @@ impl MenuCommand {
             MenuCommand::RemoveBookmark => t!("menu-remove-bookmark"),
             MenuCommand::ListBookmarks => t!("cmd-list-bookmarks"),
             MenuCommand::Format => t!("cmd-format"),
+            MenuCommand::CompareWithClipboard => t!("menu-compare-with-clipboard"),
+            MenuCommand::CompareSelectionWithClipboard => {
+                t!("menu-compare-selection-with-clipboard")
+            }
+            MenuCommand::CompareWithSaved => t!("menu-compare-with-saved"),
             MenuCommand::FormatSelection => t!("cmd-format-selection"),
             MenuCommand::Fix => t!("cmd-fix"),
             MenuCommand::ToolAuto => t!("format-tool-auto"),
@@ -903,6 +943,7 @@ impl MenuCommand {
             MenuCommand::Cut => Action::Cut,
             MenuCommand::Copy => Action::Copy,
             MenuCommand::Paste => Action::Paste,
+            MenuCommand::PastePlain => Action::MarkdownPastePlain,
             MenuCommand::SelectAll => Action::SelectAll,
             MenuCommand::TerminalFind => Action::FindInTerminal,
             MenuCommand::TerminalClear => Action::ClearTerminal,
@@ -910,6 +951,11 @@ impl MenuCommand {
             MenuCommand::TerminalDock => Action::ToggleTerminalPosition,
             MenuCommand::NewTerminal => Action::NewTerminal,
             MenuCommand::SplitTerminal => Action::SplitTerminal,
+            MenuCommand::MoveTerminalRight | MenuCommand::MoveTerminalDown => {
+                Action::MoveTerminalToGroup
+            }
+            MenuCommand::MoveTerminalToEditor => Action::MoveTerminalToEditor,
+            MenuCommand::MoveTerminalToPanel => Action::MoveTerminalToPanel,
             MenuCommand::RenameTerminal => Action::RenameTerminal,
             MenuCommand::CloseTerminal => Action::CloseTerminal,
             MenuCommand::GitRevertHunk => Action::GitRevertChange,
@@ -925,6 +971,10 @@ impl MenuCommand {
             MenuCommand::Format => Action::Format,
             MenuCommand::FormatSelection => Action::FormatSelection,
             MenuCommand::Fix => Action::Fix,
+            MenuCommand::CompareWithClipboard | MenuCommand::CompareSelectionWithClipboard => {
+                Action::CompareWithClipboard
+            }
+            MenuCommand::CompareWithSaved => Action::CompareWithSaved,
             MenuCommand::NewFile => Action::NewFile,
             MenuCommand::IndentUsingSpaces => Action::IndentUsingSpaces,
             MenuCommand::IndentUsingTabs => Action::IndentUsingTabs,
@@ -988,10 +1038,14 @@ pub enum MenuTarget {
     Whitespace,
     /// 设置的编辑器页中的「Vim 剪贴板」。
     VimClipboard,
+    /// 设置的编辑器页中「快捷键冲突」的一行：`Ctrl` 与这个字符的组合。
+    VimKey(char),
     /// 设置的 Git 页中的「打开工作树」。
     OpenWorktree,
     /// 设置的 Git 页中的「拉取方式」。
     PullMode,
+    /// 设置页的「日志位置」。
+    LogPlacement,
     /// 设置的编辑器页中的「拖入目录」。
     DropFolder,
     /// 「在文件中查找」设置的选项菜单。
@@ -1082,12 +1136,14 @@ pub enum MenuTarget {
     LogPath,
     /// 日志里的一个提交（完整的提交号）。
     LogCommit(String),
+    /// 提交视图中提交历史里的一个提交（完整的提交号）。
+    HistoryCommit(String),
     /// 日志详情（或比较）里改动的一个文件：文件列表里的下标和文件的路径。
     LogFile(usize, PathBuf),
     /// 终端标签栏上的一个标签（编号）。
     TerminalTab(u16),
-    /// 终端面板里正在看的标签，以及右键点着的命令块（编号；没点在运行过的块上时为 `None`）。
-    Terminal(Option<u32>),
+    /// 右键点着的终端编号和命令块编号，菜单打开后不随当前焦点改变。
+    Terminal(u16, Option<u32>),
     /// 全局搜索结果里的一行：文件的路径和该文件中第几处匹配（`None` 是文件行），和
     /// `GlobalSearch::selected` 的记法相同。
     SearchResult(PathBuf, Option<usize>),

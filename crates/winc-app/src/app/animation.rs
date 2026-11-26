@@ -358,6 +358,9 @@ impl App {
                 *slot = None;
             }
         }
+        if self.panes.motion.as_ref().is_some_and(|m| m.done()) {
+            self.panes.motion = None;
+        }
 
         settle(&mut self.panels.sidebar.motion, |m| m.clock);
         settle(&mut self.panels.tree.motion, |m| m.clock);
@@ -382,6 +385,8 @@ impl App {
         settle(&mut self.git.commit.button_motion, |m| m.1);
         settle(&mut self.git.commit.stashes.motion, |m| m.1);
         settle(&mut self.git.commit.worktrees.motion, |m| m.1);
+        settle(&mut self.git.commit.history.drawer.motion, |m| m.1);
+        settle(&mut self.git.panel.motion, |m| m.1);
         settle(&mut self.panels.outline.motion, |m| m.1);
         settle(&mut self.panels.outline.fold, |f| f.clock);
         settle(&mut self.preview.markdown.toc_fade, |c| *c);
@@ -398,6 +403,7 @@ impl App {
             motion.settle();
         }
         self.finish_diff_fold(false);
+        self.finish_combined_fold(false);
         settle(&mut self.scroll.glide, |g| g.clock);
         self.scroll.pane_glides.retain(|g| !g.clock.done());
         settle(&mut self.overlays.picker.motion, |m| m.clock);
@@ -453,6 +459,7 @@ impl App {
         settle(&mut self.terminal.motion, |m| m.clock);
         settle(&mut self.terminal.grow, |c| *c);
         settle(&mut self.preview.markdown.motion, |m| m.clock);
+        settle(&mut self.http.finished, |f| f.clock);
         self.status.motion.settle();
     }
 
@@ -490,6 +497,7 @@ impl App {
     pub(super) fn animating(&self) -> bool {
         self.panels.sidebar.motion.is_some()
             || self.panels.tree.motion.is_some()
+            || self.panes.motion.is_some()
             || self.panels.tree.labels.moving()
             || self.git.commit.names.moving()
             || self.panels.global.names.moving()
@@ -511,6 +519,8 @@ impl App {
             || self.git.context_row.motion.is_some()
             || self.git.commit.stashes.motion.is_some()
             || self.git.commit.worktrees.motion.is_some()
+            || self.git.commit.history.drawer.motion.is_some()
+            || self.git.panel.motion.is_some()
             || self.panels.outline.motion.is_some()
             || self.panels.outline.fold.is_some()
             || self.preview.markdown.toc_fade.is_some()
@@ -527,6 +537,7 @@ impl App {
             || self.panels.global.rows_moving()
             || self.motion.fold_motion.is_some()
             || self.motion.diff_fold.is_some()
+            || self.git.combined.as_ref().is_some_and(|t| t.folding())
             || self.motion.caret_motion.is_some_and(|m| m.moving())
             || self.scroll.glide.is_some()
             || self.scroll.wheel.glide.is_some()
@@ -577,6 +588,7 @@ impl App {
             || self.overlays.tooltip.leaving.is_some()
             || self.tooltip_fading_in()
             || (self.disk.loads.bar).is_some_and(|b| b.clock.is_some())
+            || self.http_animating()
             || ((self.git.branch.running.is_some()
                 || self.git.branch.finished.is_some()
                 || self.commit_refreshing())
